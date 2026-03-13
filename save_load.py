@@ -8,7 +8,6 @@ from config import (
     DATASET_PATH, BT_TRADES_PATH, BT_SUMMARY_PATH, BT_EQUITY_PATH,
     WF_PATH, WF_TRADES_PATH, WF_EQUITY_PATH, SEQ_LEN,
 )
-from sequence_dataset import build_sequence_bundle
 from features import get_base_features
 
 
@@ -30,11 +29,12 @@ def save_outputs(model, scaler, feature_cols: list, metrics: dict, df_full: pd.D
     with open(METRICS_PATH, "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-    bundle = build_sequence_bundle(df_full, SEQ_LEN)
-    row_df = bundle.row_df.copy()
+    # Save dataset (subset of rows for inspection)
     feature_df = get_base_features(df_full).dropna().reset_index(drop=True)
-    feature_df = feature_df.iloc[-len(row_df):].reset_index(drop=True)
-    save_df = pd.concat([row_df.reset_index(drop=True), feature_df.reset_index(drop=True)], axis=1)
+    base_cols = ["time", "open", "high", "low", "close"]
+    base_cols = [c for c in base_cols if c in df_full.columns]
+    base_df = df_full[base_cols].iloc[-len(feature_df):].reset_index(drop=True)
+    save_df = pd.concat([base_df, feature_df], axis=1)
     save_df.to_csv(DATASET_PATH, index=False)
 
     if test_trades_df is not None:

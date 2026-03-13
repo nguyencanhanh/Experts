@@ -119,11 +119,9 @@ def get_supported_filling(symbol: str):
     if info is None:
         raise RuntimeError(f"Không lấy được symbol_info cho {symbol}")
 
-    filling_mode = int(info.filling_mode)
-    if filling_mode == mt5.ORDER_FILLING_FOK:
+    filling = info.filling_mode
+    if filling & mt5.SYMBOL_FILLING_FOK:
         return mt5.ORDER_FILLING_FOK
-    if filling_mode == mt5.ORDER_FILLING_IOC:
+    if filling & mt5.SYMBOL_FILLING_IOC:
         return mt5.ORDER_FILLING_IOC
-    if filling_mode == mt5.ORDER_FILLING_RETURN:
-        return mt5.ORDER_FILLING_RETURN
-    return mt5.ORDER_FILLING_IOC
+    return mt5.ORDER_FILLING_RETURN

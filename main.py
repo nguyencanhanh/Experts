@@ -1,12 +1,16 @@
 import json
 import pandas as pd
+import numpy as np
 
-from config import SYMBOL, YEARS_BACK, TRAIN_RATIO, VALID_RATIO, TIMEFRAMES
-from utils import set_seed, StandardScaler3D
+from config import (
+    SYMBOL, MODEL_PATH, SCALER_PATH, FEATURES_PATH, METRICS_PATH,
+    TRAIN_RATIO, VALID_RATIO, TIMEFRAMES, YEARS_BACK, SEQ_LEN, DEVICE,
+)
+from utils import set_seed, FeatureScaler
 from data_mt5 import mt5_init, mt5_shutdown, ensure_symbol, get_symbol_info, get_rates
 from features import add_indicators, merge_timeframes, add_cross_features, get_base_features
 from filters import load_news_events
-from sequence_dataset import build_sequence_bundle
+from sequence_dataset import build_sequence_bundle, SequenceDataset
 from trainer import train_model, predict_proba, evaluate
 from backtest import backtest_strategy, optimize_thresholds, run_walkforward
 from save_load import save_outputs
@@ -40,50 +44,61 @@ def train_pipeline():
     print(df[["time", "open", "high", "low", "close"]].tail())
 
     bundle = build_sequence_bundle(df)
+    n = bundle.n_sequences
+    print(f"Sequences: {n} (features: {bundle.features.shape[1]}, seq_len: {bundle.seq_len})")
 
-    n = len(bundle.x)
+    # ── Label distribution ──
+    unique, counts = np.unique(bundle.targets, return_counts=True)
+    for u, c in zip(unique, counts):
+        print(f"  class {u}: {c} ({c / n:.1%})")
+
     train_end = int(n * TRAIN_RATIO)
     valid_end = train_end + int(n * VALID_RATIO)
 
-    x_train = bundle.x[:train_end]
-    y_train = bundle.y[:train_end]
-    x_valid = bundle.x[train_end:valid_end]
-    y_valid = bundle.y[train_end:valid_end]
-    x_test = bundle.x[valid_end:]
-    y_test = bundle.y[valid_end:]
+    # ── Fit scaler on training features (2D — memory efficient) ──
+    scaler = FeatureScaler()
+    scaler.fit(bundle.features[:train_end + bundle.seq_len - 1])
+    scaled = scaler.transform(bundle.features)
+
+    # ── Create lazy datasets ──
+    train_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, 0, train_end)
+    valid_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, train_end, valid_end - train_end)
+    test_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, valid_end, n - valid_end)
 
     row_df_valid = bundle.row_df.iloc[train_end:valid_end].reset_index(drop=True)
     row_df_test = bundle.row_df.iloc[valid_end:].reset_index(drop=True)
 
-    scaler = StandardScaler3D()
-    x_train_sc = scaler.fit_transform(x_train)
-    x_valid_sc = scaler.transform(x_valid)
-    x_test_sc = scaler.transform(x_test)
+    # ── Train ──
+    model = train_model(train_ds, valid_ds, input_size=bundle.features.shape[-1])
 
-    model = train_model(x_train_sc, y_train, x_valid_sc, y_valid, input_size=x_train_sc.shape[-1])
+    # ── Evaluate ──
+    eval_train = evaluate(model, train_ds)
+    eval_valid = evaluate(model, valid_ds)
+    eval_test = evaluate(model, test_ds)
 
-    eval_train = evaluate(model, x_train_sc, y_train)
-    eval_valid = evaluate(model, x_valid_sc, y_valid)
-    eval_test = evaluate(model, x_test_sc, y_test)
-
-    valid_probs = predict_proba(model, x_valid_sc)
+    # ── Optimize thresholds on validation ──
+    valid_probs = predict_proba(model, valid_ds)
     threshold_table, best = optimize_thresholds(row_df_valid, valid_probs, symbol_info, news_df)
 
     best_buy = float(best["buy_threshold"])
     best_sell = float(best["sell_threshold"])
 
-    test_probs = predict_proba(model, x_test_sc)
+    # ── Test backtest ──
+    test_probs = predict_proba(model, test_ds)
     test_trades_df, test_equity_df, test_summary = backtest_strategy(
         row_df_test, test_probs, symbol_info, news_df, best_buy, best_sell
     )
 
     # ── FIX: Refit scaler on train+valid for deploy model ──
-    x_deploy = bundle.x[:valid_end]
-    y_deploy = bundle.y[:valid_end]
-    deploy_scaler = StandardScaler3D()
-    x_deploy_sc = deploy_scaler.fit_transform(x_deploy)
-    deploy_model = train_model(x_deploy_sc, y_deploy, x_valid_sc, y_valid, input_size=x_train_sc.shape[-1])
+    deploy_scaler = FeatureScaler()
+    deploy_scaler.fit(bundle.features[:valid_end + bundle.seq_len - 1])
+    deploy_scaled = deploy_scaler.transform(bundle.features)
 
+    deploy_train_ds = SequenceDataset(deploy_scaled, bundle.targets, bundle.seq_len, 0, valid_end)
+    deploy_valid_ds = SequenceDataset(deploy_scaled, bundle.targets, bundle.seq_len, train_end, valid_end - train_end)
+    deploy_model = train_model(deploy_train_ds, deploy_valid_ds, input_size=bundle.features.shape[-1])
+
+    # ── Walk-forward ──
     wf_results_df, wf_trades_df, wf_equity_df, wf_summary = run_walkforward(
         bundle=bundle,
         trainer_predict_fn=predict_proba,
@@ -94,9 +109,9 @@ def train_pipeline():
 
     metrics = {
         "rows_total": int(n),
-        "rows_train": int(len(x_train)),
-        "rows_valid": int(len(x_valid)),
-        "rows_test": int(len(x_test)),
+        "rows_train": int(train_end),
+        "rows_valid": int(valid_end - train_end),
+        "rows_test": int(n - valid_end),
         "eval_train": eval_train,
         "eval_valid": eval_valid,
         "eval_test": eval_test,

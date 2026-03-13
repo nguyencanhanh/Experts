@@ -8,7 +8,7 @@ from config import (
     USE_PARTIAL_TP, PARTIAL_CLOSE_RATIO, USE_BREAK_EVEN,
     USE_TRAILING_STOP, TRAILING_ATR_MULT,
     BUY_THRESHOLD_GRID, SELL_THRESHOLD_GRID,
-    WF_TRAIN_BARS, WF_TEST_BARS, WF_STEP_BARS,
+    WF_TRAIN_BARS, WF_TEST_BARS, WF_STEP_BARS, SEQ_LEN,
 )
 from filters import (
     is_in_sessions, is_in_news_window, compute_rr_from_proba,
@@ -129,7 +129,7 @@ def simulate_trade(df, entry_idx, side, entry, sl, tp, volume, symbol_info, hori
 
 
 def score_summary(summary: dict) -> float:
-    """Improved scoring: normalized by initial balance, with min-trade penalty."""
+    """Regularized scoring — penalizes extreme thresholds to reduce overfit."""
     n = summary["trades"]
     if n == 0:
         return 0.0
@@ -140,7 +140,13 @@ def score_summary(summary: dict) -> float:
     wr = max(summary["win_rate"], 0.01)
     trade_factor = min(n / 20.0, 1.0)
 
-    return net_norm * pf * dd * (wr ** 1.5) * trade_factor
+    # Penalize extreme thresholds (too high = too few trades, likely overfit)
+    bt = summary.get("buy_threshold", 0.55)
+    st = summary.get("sell_threshold", 0.55)
+    threshold_penalty = 1.0 - 0.3 * max(0, bt - 0.60) - 0.3 * max(0, st - 0.60)
+    threshold_penalty = max(threshold_penalty, 0.5)
+
+    return net_norm * pf * dd * (wr ** 1.5) * trade_factor * threshold_penalty
 
 
 def backtest_strategy(row_df: pd.DataFrame, probs: np.ndarray, symbol_info, news_df: pd.DataFrame,
@@ -340,12 +346,17 @@ def optimize_thresholds(valid_row_df, valid_probs, symbol_info, news_df):
 
 
 def run_walkforward(bundle, trainer_predict_fn, trainer_train_fn, symbol_info, news_df):
+    """Walk-forward analysis — updated for new SequenceBundle API."""
+    from utils import FeatureScaler
+    from sequence_dataset import SequenceDataset
+
     wf_results = []
     wf_trades = []
     wf_equity = []
 
     start = 0
     window_id = 0
+    seq_len = bundle.seq_len
 
     while True:
         train_start = start
@@ -353,38 +364,38 @@ def run_walkforward(bundle, trainer_predict_fn, trainer_train_fn, symbol_info, n
         test_start = train_end
         test_end = test_start + WF_TEST_BARS
 
-        if test_end > len(bundle.x):
+        if test_end > bundle.n_sequences:
             break
 
-        x_train_full = bundle.x[train_start:train_end]
-        y_train_full = bundle.y[train_start:train_end]
-        row_df_train_full = bundle.row_df.iloc[train_start:train_end].reset_index(drop=True)
+        # Fit scaler on training features (2D)
+        feat_start = train_start
+        feat_end = train_end + seq_len - 1
+        scaler = FeatureScaler()
+        scaler.fit(bundle.features[feat_start:feat_end])
 
-        valid_cut = int(len(x_train_full) * 0.85)
-        x_train = x_train_full[:valid_cut]
-        y_train = y_train_full[:valid_cut]
-        x_valid = x_train_full[valid_cut:]
-        y_valid = y_train_full[valid_cut:]
-        row_df_valid = row_df_train_full.iloc[valid_cut:].reset_index(drop=True)
+        # Scale all features
+        scaled = scaler.transform(bundle.features)
 
-        x_test = bundle.x[test_start:test_end]
+        # Split train/valid
+        valid_cut = int((train_end - train_start) * 0.85)
+        actual_valid_start = train_start + valid_cut
+
+        train_ds = SequenceDataset(scaled, bundle.targets, seq_len, train_start, valid_cut)
+        valid_ds = SequenceDataset(scaled, bundle.targets, seq_len, actual_valid_start, train_end - actual_valid_start)
+        test_ds = SequenceDataset(scaled, bundle.targets, seq_len, test_start, test_end - test_start)
+
+        row_df_valid = bundle.row_df.iloc[actual_valid_start:train_end].reset_index(drop=True)
         row_df_test = bundle.row_df.iloc[test_start:test_end].reset_index(drop=True)
 
-        from utils import StandardScaler3D
-        scaler = StandardScaler3D()
-        x_train_sc = scaler.fit_transform(x_train)
-        x_valid_sc = scaler.transform(x_valid)
-        x_test_sc = scaler.transform(x_test)
+        model = trainer_train_fn(train_ds, valid_ds, input_size=bundle.features.shape[-1])
 
-        model = trainer_train_fn(x_train_sc, y_train, x_valid_sc, y_valid, input_size=x_train_sc.shape[-1])
-
-        valid_probs = trainer_predict_fn(model, x_valid_sc)
+        valid_probs = trainer_predict_fn(model, valid_ds)
         _, best = optimize_thresholds(row_df_valid, valid_probs, symbol_info, news_df)
 
         buy_threshold = float(best["buy_threshold"])
         sell_threshold = float(best["sell_threshold"])
 
-        test_probs = trainer_predict_fn(model, x_test_sc)
+        test_probs = trainer_predict_fn(model, test_ds)
         trades_df, equity_df, summary = backtest_strategy(
             row_df_test, test_probs, symbol_info, news_df, buy_threshold, sell_threshold
         )

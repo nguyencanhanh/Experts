@@ -18,8 +18,10 @@ from config import (
     LIVE_LOG_PATH, TIMEFRAMES, SEQ_LEN, DEVICE,
     MAX_DAILY_LOSS_PCT, MAX_OPEN_POSITIONS, MAGIC,
     MT5_RECONNECT_WAIT_SEC, HEARTBEAT_INTERVAL_SEC,
+    MAX_STALE_MINUTES, MAX_LATENCY_MS, MAX_POSITION_HOURS,
+    EQUITY_DRAWDOWN_STOP_PCT,
 )
-from utils import append_csv_row
+from utils import append_csv_row, FeatureScaler
 from data_mt5 import get_symbol_info, get_open_positions, get_recent_rates
 from features import add_indicators, merge_timeframes, add_cross_features, get_base_features
 from filters import (
@@ -29,7 +31,7 @@ from filters import (
 from execution import place_market_order, modify_position_sl_tp, close_partial_position
 from backtest import calc_lot_by_risk, round_volume
 from model import CNNBiLSTMTransformer
-from trainer import predict_proba
+from sequence_dataset import SequenceDataset
 
 
 def build_live_sequence_frame(symbol: str):
@@ -51,22 +53,47 @@ def build_live_sequence_frame(symbol: str):
     return df
 
 
-def build_live_sequence_inputs(df_live, seq_len, feature_cols):
+def check_data_stale(df, max_stale_minutes: int = MAX_STALE_MINUTES) -> bool:
+    """Check if data is stale (delayed more than max_stale_minutes)."""
+    if len(df) == 0:
+        return True
+    last_time = df["time"].iloc[-1]
+    if hasattr(last_time, "tz_localize"):
+        now = datetime.now(pytz.UTC)
+    else:
+        now = np.datetime64("now")
+    age_minutes = (now - last_time).total_seconds() / 60.0 if hasattr(last_time, "total_seconds") else 999
+    try:
+        age_minutes = (datetime.now(pytz.UTC) - last_time.to_pydatetime()).total_seconds() / 60.0
+    except Exception:
+        return False
+    if age_minutes > max_stale_minutes:
+        print(f"⚠️ Stale data: last bar is {age_minutes:.1f} min old")
+        return True
+    return False
+
+
+def build_live_sequence_inputs(df_live, seq_len, feature_cols, scaler):
+    """Build scaled 2D features and create SequenceDataset for live inference."""
     feat_df = get_base_features(df_live)
     feat_df = feat_df.dropna().reset_index(drop=True)
 
     df_aligned = df_live.iloc[-len(feat_df):].reset_index(drop=True).copy()
     arr = feat_df[feature_cols].values.astype("float32")
 
-    x_list = []
-    row_idx = []
-    for i in range(seq_len - 1, len(df_aligned)):
-        x_list.append(arr[i - seq_len + 1:i + 1])
-        row_idx.append(i)
+    # Scale the 2D features
+    scaled = scaler.transform(arr)
 
-    x = np.stack(x_list).astype("float32")
-    row_df = df_aligned.iloc[row_idx].reset_index(drop=True)
-    return x, row_df
+    # Create dummy targets for the dataset
+    n_seq = len(scaled) - seq_len + 1
+    if n_seq <= 0:
+        return None, None, None
+
+    targets = np.zeros(n_seq, dtype=np.int64)
+    ds = SequenceDataset(scaled, targets, seq_len, 0, n_seq)
+
+    row_df = df_aligned.iloc[seq_len - 1:].reset_index(drop=True)
+    return ds, row_df, scaled
 
 
 def log_reject(signal_time, reason, p_buy, p_sell, spread_points, row):
@@ -84,7 +111,6 @@ def log_reject(signal_time, reason, p_buy, p_sell, spread_points, row):
     })
 
 
-# ── NEW: Daily loss protection ──
 def check_daily_loss_exceeded(symbol: str) -> bool:
     account = mt5.account_info()
     if account is None:
@@ -113,7 +139,20 @@ def check_daily_loss_exceeded(symbol: str) -> bool:
     return False
 
 
-# ── NEW: MT5 reconnect ──
+def check_equity_drawdown(symbol: str) -> bool:
+    """Check equity drawdown from balance — additional safety layer."""
+    account = mt5.account_info()
+    if account is None:
+        return True
+    if account.balance <= 0:
+        return True
+    dd = (account.balance - account.equity) / account.balance
+    if dd >= EQUITY_DRAWDOWN_STOP_PCT:
+        print(f"⚠️ Equity drawdown: {dd:.2%} >= {EQUITY_DRAWDOWN_STOP_PCT:.2%}")
+        return True
+    return False
+
+
 def ensure_mt5_connected() -> bool:
     try:
         info = mt5.terminal_info()
@@ -128,6 +167,27 @@ def ensure_mt5_connected() -> bool:
             raise RuntimeError(f"MT5 reconnect failed: {mt5.last_error()}")
         print("MT5 reconnected")
         return True
+
+
+def close_expired_positions(symbol: str, max_hours: float = MAX_POSITION_HOURS):
+    """Close positions that have been open too long without hitting TP/SL."""
+    positions = get_open_positions(symbol)
+    if not positions:
+        return
+
+    now = datetime.now(pytz.UTC)
+    for pos in positions:
+        try:
+            open_time = datetime.fromtimestamp(pos.time, tz=pytz.UTC)
+            hours_open = (now - open_time).total_seconds() / 3600.0
+            if hours_open >= max_hours:
+                print(f"⏰ Position {pos.ticket} open {hours_open:.1f}h — closing (timeout)")
+                from execution import close_partial_position as _close
+                tick = mt5.symbol_info_tick(symbol)
+                if tick:
+                    _close(symbol, pos, pos.volume)
+        except Exception as e:
+            print(f"Error closing expired position: {e}")
 
 
 def manage_open_positions(symbol: str):
@@ -189,6 +249,12 @@ def manage_open_positions(symbol: str):
                     close_partial_position(symbol, pos, close_vol)
 
 
+def predict_live(model, ds, batch_size=1024):
+    """Predict probabilities for live data using SequenceDataset."""
+    from trainer import predict_proba
+    return predict_proba(model, ds, batch_size=batch_size)
+
+
 def run_live():
     if not (os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH) and os.path.exists(FEATURES_PATH) and os.path.exists(METRICS_PATH)):
         raise RuntimeError("Thiếu model/scaler/features/metrics. Hãy train trước.")
@@ -217,13 +283,14 @@ def run_live():
 
     print(f"Live V7 started | buy_th={buy_threshold} sell_th={sell_threshold}")
     print(f"Safety: max_daily_loss={MAX_DAILY_LOSS_PCT:.1%} max_positions={MAX_OPEN_POSITIONS}")
+    print(f"        equity_dd_stop={EQUITY_DRAWDOWN_STOP_PCT:.1%} position_timeout={MAX_POSITION_HOURS}h")
+    print(f"        max_latency={MAX_LATENCY_MS}ms max_stale={MAX_STALE_MINUTES}min")
 
     while True:
         try:
-            # ── NEW: Reconnect check ──
             ensure_mt5_connected()
 
-            # ── NEW: Heartbeat ──
+            # Heartbeat
             if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
                 account = mt5.account_info()
                 bal = account.balance if account else 0
@@ -231,22 +298,34 @@ def run_live():
                 print(f"♥ Heartbeat | balance={bal:.2f} equity={eq:.2f} | {datetime.now()}")
                 last_heartbeat = time.time()
 
-            # ── NEW: Daily loss check ──
+            # Safety checks
             if check_daily_loss_exceeded(SYMBOL):
                 time.sleep(60)
                 continue
 
+            if check_equity_drawdown(SYMBOL):
+                time.sleep(60)
+                continue
+
+            # Close expired positions
+            close_expired_positions(SYMBOL)
+
             manage_open_positions(SYMBOL)
 
             df_live = build_live_sequence_frame(SYMBOL)
-            x_live, row_df = build_live_sequence_inputs(df_live, SEQ_LEN, feature_cols)
 
-            if len(x_live) < 20:
+            # Stale data check
+            if check_data_stale(df_live):
+                time.sleep(10)
+                continue
+
+            ds, row_df, scaled = build_live_sequence_inputs(df_live, SEQ_LEN, feature_cols, scaler)
+
+            if ds is None or len(ds) < 20:
                 time.sleep(2)
                 continue
 
-            x_live_sc = scaler.transform(x_live)
-            probs = predict_proba(model, x_live_sc, batch_size=1024)
+            probs = predict_live(model, ds)
 
             signal_idx = len(row_df) - 2
             signal_row = row_df.iloc[signal_idx]
@@ -283,7 +362,7 @@ def run_live():
                 time.sleep(2)
                 continue
 
-            # ── NEW: Max positions check ──
+            # Max positions check
             positions = get_open_positions(SYMBOL)
             if len(positions) >= MAX_OPEN_POSITIONS:
                 time.sleep(2)
@@ -338,6 +417,18 @@ def run_live():
                 time.sleep(2)
                 continue
 
+            # Re-check spread right before order (race condition mitigation)
+            tick = mt5.symbol_info_tick(SYMBOL)
+            if tick is None:
+                time.sleep(2)
+                continue
+            spread_points_now = (tick.ask - tick.bid) / symbol_info.point
+            if spread_points_now > MAX_SPREAD_POINTS:
+                log_reject(signal_time, "reject_spread_recheck", p_buy, p_sell, spread_points_now, signal_row)
+                last_reject_time = signal_time
+                time.sleep(2)
+                continue
+
             rr = compute_rr_from_proba(pred_prob)
             sl_dist = atr_now * SL_ATR_MULT
 
@@ -361,6 +452,10 @@ def run_live():
             result = place_market_order(SYMBOL, side, volume, sl, tp)
             latency_ms = (time.time() - t_start) * 1000
 
+            # Latency guard
+            if latency_ms > MAX_LATENCY_MS:
+                print(f"⚠️ High latency: {latency_ms:.0f}ms (max={MAX_LATENCY_MS}ms)")
+
             append_csv_row(LIVE_LOG_PATH, {
                 "signal_time": str(signal_time),
                 "event": "order_send",
@@ -372,7 +467,7 @@ def run_live():
                 "comment": getattr(result, "comment", "") if result is not None else "None",
                 "order": getattr(result, "order", None) if result is not None else None,
                 "deal": getattr(result, "deal", None) if result is not None else None,
-                "spread_points": spread_points,
+                "spread_points": spread_points_now,
                 "latency_ms": round(latency_ms, 1),
             })
 

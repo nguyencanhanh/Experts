@@ -1,7 +1,7 @@
 import copy
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from sklearn.metrics import classification_report, confusion_matrix
 
 from config import (
@@ -9,21 +9,12 @@ from config import (
     USE_FOCAL_LOSS, FOCAL_GAMMA, LABEL_SMOOTHING,
     WEIGHT_DECAY, LR, USE_ONECYCLE, MAX_LR,
     USE_AMP, USE_EMA_WEIGHTS, EMA_DECAY, EARLY_STOPPING_PATIENCE,
+    USE_COSINE_ANNEALING, WARMUP_EPOCHS,
+    GRAD_ACCUM_STEPS, USE_MIXUP, MIXUP_ALPHA,
 )
 from utils import FocalLoss, ModelEMA
 from model import CNNBiLSTMTransformer
-
-
-class TorchSequenceDataset(Dataset):
-    def __init__(self, x, y):
-        self.x = torch.tensor(x, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.long)
-
-    def __len__(self):
-        return len(self.x)
-
-    def __getitem__(self, idx):
-        return self.x[idx], self.y[idx]
+from sequence_dataset import SequenceDataset
 
 
 def compute_class_weights(y: np.ndarray):
@@ -33,17 +24,37 @@ def compute_class_weights(y: np.ndarray):
     return torch.tensor(weights, dtype=torch.float32, device=DEVICE)
 
 
-def train_model(x_train, y_train, x_valid, y_valid, input_size: int):
-    train_loader = DataLoader(
-        TorchSequenceDataset(x_train, y_train),
-        batch_size=BATCH_SIZE, shuffle=True, drop_last=False,
-    )
-    valid_loader = DataLoader(
-        TorchSequenceDataset(x_valid, y_valid),
-        batch_size=BATCH_SIZE, shuffle=False, drop_last=False,
-    )
+def mixup_data(x, y, alpha=0.2):
+    """Mixup augmentation for sequence classification."""
+    if alpha <= 0:
+        return x, y, y, 1.0
+    lam = np.random.beta(alpha, alpha)
+    lam = max(lam, 1.0 - lam)  # Ensure lam >= 0.5
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size, device=x.device)
+    mixed_x = lam * x + (1.0 - lam) * x[index]
+    return mixed_x, y, y[index], lam
+
+
+def mixup_criterion(criterion, logits, y_a, y_b, lam):
+    """Compute loss for mixup."""
+    return lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b)
+
+
+def train_model(train_ds: SequenceDataset, valid_ds: SequenceDataset, input_size: int):
+    """Train model using lazy SequenceDataset.
+
+    Args:
+        train_ds: Training SequenceDataset
+        valid_ds: Validation SequenceDataset
+        input_size: Number of features
+    """
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+    valid_loader = DataLoader(valid_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
 
     model = CNNBiLSTMTransformer(input_size=input_size).to(DEVICE)
+
+    y_train = train_ds.get_all_targets()
     class_weights = compute_class_weights(y_train)
 
     if USE_FOCAL_LOSS:
@@ -52,14 +63,28 @@ def train_model(x_train, y_train, x_valid, y_valid, input_size: int):
         criterion = torch.nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+    # ── Scheduler ──
     scheduler = None
-    if USE_ONECYCLE:
+    if USE_COSINE_ANNEALING:
+        # Cosine annealing with warmup
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, end_factor=1.0, total_iters=WARMUP_EPOCHS * max(1, len(train_loader)),
+        )
+        cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=(MAX_EPOCHS - WARMUP_EPOCHS) * max(1, len(train_loader)),
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[WARMUP_EPOCHS * max(1, len(train_loader))],
+        )
+    elif USE_ONECYCLE:
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=MAX_LR,
             steps_per_epoch=max(1, len(train_loader)), epochs=MAX_EPOCHS,
         )
 
-    # ── FIX: Updated PyTorch AMP API ──
     scaler_amp = torch.amp.GradScaler("cuda", enabled=USE_AMP)
     ema = ModelEMA(model, decay=EMA_DECAY) if USE_EMA_WEIGHTS else None
 
@@ -71,33 +96,47 @@ def train_model(x_train, y_train, x_valid, y_valid, input_size: int):
         model.train()
         train_loss = 0.0
         train_count = 0
+        optimizer.zero_grad(set_to_none=True)
 
-        for xb, yb in train_loader:
+        for step, (xb, yb) in enumerate(train_loader):
             xb = xb.to(DEVICE)
             yb = yb.to(DEVICE)
 
-            optimizer.zero_grad(set_to_none=True)
+            # ── Mixup augmentation ──
+            if USE_MIXUP:
+                xb, yb_a, yb_b, lam = mixup_data(xb, yb, MIXUP_ALPHA)
+            else:
+                yb_a, yb_b, lam = yb, yb, 1.0
+
             with torch.amp.autocast("cuda", enabled=USE_AMP):
                 logits = model(xb)
-                loss = criterion(logits, yb)
+                if USE_MIXUP:
+                    loss = mixup_criterion(criterion, logits, yb_a, yb_b, lam)
+                else:
+                    loss = criterion(logits, yb)
+                loss = loss / GRAD_ACCUM_STEPS
 
             scaler_amp.scale(loss).backward()
-            scaler_amp.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler_amp.step(optimizer)
-            scaler_amp.update()
+
+            # ── Gradient accumulation ──
+            if (step + 1) % GRAD_ACCUM_STEPS == 0 or (step + 1) == len(train_loader):
+                scaler_amp.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler_amp.step(optimizer)
+                scaler_amp.update()
+                optimizer.zero_grad(set_to_none=True)
 
             if scheduler is not None:
                 scheduler.step()
             if ema is not None:
                 ema.update(model)
 
-            train_loss += loss.item() * len(xb)
+            train_loss += loss.item() * GRAD_ACCUM_STEPS * len(xb)
             train_count += len(xb)
 
         train_loss /= max(train_count, 1)
 
-        # ── FIX: Apply EMA BEFORE validation & save best state with EMA weights ──
+        # ── Apply EMA before validation ──
         model.eval()
         if ema is not None:
             ema.apply_to(model)
@@ -117,7 +156,6 @@ def train_model(x_train, y_train, x_valid, y_valid, input_size: int):
 
         valid_loss /= max(valid_count, 1)
 
-        # ── FIX: Save best state WHILE EMA is applied (= EMA weights) ──
         if valid_loss < best_val_loss:
             best_val_loss = valid_loss
             best_state = copy.deepcopy(model.state_dict())
@@ -141,11 +179,41 @@ def train_model(x_train, y_train, x_valid, y_valid, input_size: int):
     return model
 
 
-def predict_proba(model, x, batch_size: int = 1024):
-    loader = DataLoader(
-        TorchSequenceDataset(x, np.zeros(len(x), dtype=np.int64)),
-        batch_size=batch_size, shuffle=False,
-    )
+def predict_proba(model, dataset_or_features, batch_size: int = 1024,
+                  targets=None, seq_len=None, start=0, count=None):
+    """Predict probabilities. Accepts either a SequenceDataset or raw scaled 2D features.
+
+    Usage 1: predict_proba(model, dataset)
+    Usage 2: predict_proba(model, scaled_features_2d, targets=t, seq_len=s, start=0, count=n)
+    """
+    if isinstance(dataset_or_features, SequenceDataset):
+        ds = dataset_or_features
+    else:
+        # Legacy: accept 2D or 3D array
+        arr = dataset_or_features
+        if arr.ndim == 3:
+            # Legacy 3D input — wrap in a simple dataset
+            from torch.utils.data import Dataset as _DS
+
+            class _LegacyDS(_DS):
+                def __init__(self, x):
+                    self.x = x
+
+                def __len__(self):
+                    return len(self.x)
+
+                def __getitem__(self, idx):
+                    return torch.from_numpy(self.x[idx].copy()).float(), torch.tensor(0, dtype=torch.long)
+
+            ds = _LegacyDS(arr)
+        else:
+            if targets is None:
+                targets = np.zeros(len(arr), dtype=np.int64)
+            if count is None:
+                count = len(arr) - (seq_len or 1) + 1
+            ds = SequenceDataset(arr, targets, seq_len, start, count)
+
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False)
 
     model.eval()
     probs_all = []
@@ -158,11 +226,18 @@ def predict_proba(model, x, batch_size: int = 1024):
     return np.concatenate(probs_all, axis=0)
 
 
-def evaluate(model, x, y):
-    probs = predict_proba(model, x)
+def evaluate(model, dataset_or_features, y=None, **kwargs):
+    """Evaluate model. Accepts SequenceDataset or legacy arrays."""
+    if isinstance(dataset_or_features, SequenceDataset):
+        probs = predict_proba(model, dataset_or_features)
+        y_true = dataset_or_features.get_all_targets()
+    else:
+        probs = predict_proba(model, dataset_or_features, **kwargs)
+        y_true = y
+
     y_pred = probs.argmax(axis=1)
     return {
-        "report_text": classification_report(y, y_pred, digits=4),
-        "report": classification_report(y, y_pred, digits=4, output_dict=True),
-        "confusion_matrix": confusion_matrix(y, y_pred).tolist(),
+        "report_text": classification_report(y_true, y_pred, digits=4),
+        "report": classification_report(y_true, y_pred, digits=4, output_dict=True),
+        "confusion_matrix": confusion_matrix(y_true, y_pred).tolist(),
     }

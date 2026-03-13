@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from config import HORIZON_BARS, SL_ATR_MULT, MIN_RR
+from config import HORIZON_BARS, SL_ATR_MULT, MIN_RR, USE_ADAPTIVE_RR
 
 
 def build_labels_no_lookahead(df: pd.DataFrame, horizon: int = HORIZON_BARS,
@@ -13,6 +13,10 @@ def build_labels_no_lookahead(df: pd.DataFrame, horizon: int = HORIZON_BARS,
     low = df["low"].values
     spread = df["spread"].values if "spread" in df.columns else np.zeros(len(df))
     atr_vals = df["M1_atr_14"].values
+
+    # ── Adaptive RR: lower RR in low-volatility regimes ──
+    atr_finite = atr_vals[np.isfinite(atr_vals) & (atr_vals > 0)]
+    atr_median = np.median(atr_finite) if len(atr_finite) > 0 else 1.0
 
     for signal_idx in range(len(df) - horizon - 2):
         entry_idx = signal_idx + 1
@@ -28,7 +32,14 @@ def build_labels_no_lookahead(df: pd.DataFrame, horizon: int = HORIZON_BARS,
         sell_entry = mid_entry - spread_price / 2.0
 
         sl_dist = atr_now * sl_atr_mult
-        tp_dist = sl_dist * min_rr
+
+        # Adaptive RR: reduce target in low-vol regimes to get more balanced labels
+        if USE_ADAPTIVE_RR and atr_now < atr_median:
+            effective_rr = min_rr * 0.85
+        else:
+            effective_rr = min_rr
+
+        tp_dist = sl_dist * effective_rr
 
         future_high = high[entry_idx:entry_idx + horizon]
         future_low = low[entry_idx:entry_idx + horizon]
@@ -45,7 +56,7 @@ def build_labels_no_lookahead(df: pd.DataFrame, horizon: int = HORIZON_BARS,
         sell_sl_idx = np.where(future_high >= sell_sl)[0]
         sell_ok = len(sell_tp_idx) > 0 and (len(sell_sl_idx) == 0 or sell_tp_idx[0] < sell_sl_idx[0])
 
-        # ── IMPROVED: handle "both win" by picking the faster TP ──
+        # Handle "both win" — pick the faster side
         if buy_ok and sell_ok:
             buy_speed = buy_tp_idx[0]
             sell_speed = sell_tp_idx[0]
