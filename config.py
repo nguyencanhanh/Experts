@@ -1,5 +1,26 @@
 import os
-import torch
+
+try:
+    import torch
+except ImportError:
+    class _TorchStub:
+        @staticmethod
+        def cuda():
+            return None
+
+        @staticmethod
+        def cuda_is_available() -> bool:
+            return False
+
+    class _TorchCudaStub:
+        @staticmethod
+        def is_available() -> bool:
+            return False
+
+    class _TorchModuleStub:
+        cuda = _TorchCudaStub()
+
+    torch = _TorchModuleStub()
 
 try:
     import MetaTrader5 as mt5
@@ -32,6 +53,8 @@ PROFILE_SLUG = _slugify(PROFILE_NAME)
 ARTIFACT_PREFIX = f"{SYMBOL_SLUG}_{ARTIFACT_VERSION}" + (f"_{PROFILE_SLUG}" if PROFILE_NAME != "base" else "")
 IS_XAU_ACTIVE_PROFILE = PROFILE_NAME in {"xau_active", "active_xau", "gold_active"} and ("XAU" in SYMBOL)
 IS_BTC_BASE_PROFILE = PROFILE_NAME in {"btc", "btc_base", "crypto_base"} and ("BTC" in SYMBOL)
+IS_BTC_ACTIVE_PROFILE = PROFILE_NAME in {"btc_active", "active_btc", "crypto_active"} and ("BTC" in SYMBOL)
+IS_BTC_PROFILE = IS_BTC_BASE_PROFILE or IS_BTC_ACTIVE_PROFILE
 
 TIMEFRAMES = {
     "M1": mt5.TIMEFRAME_M1,
@@ -160,11 +183,27 @@ if IS_XAU_ACTIVE_PROFILE:
     MIN_M15_TREND_STRENGTH = 0.00003
     MIN_H1_TREND_STRENGTH = 0.00003
 
-if IS_BTC_BASE_PROFILE:
+if IS_BTC_PROFILE:
     # BTC trades continuously, so the XAU session/news gates are usually too restrictive.
     SESSION_FILTER = False
     USE_NEWS_FILTER = False
     MAX_SPREAD_POINTS = _env_int("TRADE_BOT_BTC_MAX_SPREAD_POINTS", 5000)
+
+if IS_BTC_ACTIVE_PROFILE:
+    # More active BTC variant: same 24/7 handling as BTC base, but with easier labels/live gates.
+    HORIZON_BARS = 24
+    SL_ATR_MULT = 1.30
+    MIN_RR = 1.20
+    SIGNAL_SMOOTH_BARS = 2
+    COOLDOWN_BARS = 6
+    REJECT_COOLDOWN_BARS = 1
+    BUY_THRESHOLD_GRID = [0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60]
+    SELL_THRESHOLD_GRID = [0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60]
+    LIVE_BUY_THRESHOLD_OFFSET = 0.01
+    LIVE_SELL_THRESHOLD_OFFSET = 0.01
+    MIN_ATR_PCT = 0.00012
+    MIN_M15_TREND_STRENGTH = 0.00003
+    MIN_H1_TREND_STRENGTH = 0.00003
 
 RR_MAP = [
     (0.82, 2.00),
@@ -176,7 +215,7 @@ RR_MAP = [
 
 # ── Asset-specific ──
 ROUND_LEVELS = [10, 50, 100]
-if IS_BTC_BASE_PROFILE:
+if IS_BTC_PROFILE:
     ROUND_LEVELS = [100, 500, 1000]
 
 # Backward-compatible alias used by older code/comments.

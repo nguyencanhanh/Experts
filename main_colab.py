@@ -8,7 +8,7 @@ import os
 def parse_args():
     parser = argparse.ArgumentParser(description="Offline/Colab trainer and backtester")
     parser.add_argument("--symbol", default="XAUUSD", help="Trading symbol, for example XAUUSD or BTCUSD")
-    parser.add_argument("--profile", default="base", help="Profile name, for example base, xau_active, btc_base")
+    parser.add_argument("--profile", default="base", help="Profile name, for example base, xau_active, btc_base, btc_active")
     parser.add_argument("--years-back", type=int, default=1, help="How much history to keep from the uploaded CSVs")
     parser.add_argument("--data-dir", default="data/cache/mt5", help="Directory containing offline CSVs")
     parser.add_argument("--news-csv", default="data/inputs/news_events.csv", help="Optional news CSV path")

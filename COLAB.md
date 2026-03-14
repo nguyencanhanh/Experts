@@ -75,6 +75,12 @@ Upload your CSV files into a folder such as `/content/data`.
 !python main_colab.py --symbol XAUUSD --profile xau_active --mode pipeline --years-back 1 --data-dir /content/data
 ```
 
+For BTC active:
+
+```python
+!python main_colab.py --symbol BTCUSD --profile btc_active --mode pipeline --years-back 1 --data-dir /content/data
+```
+
 ## Backtest only using saved artifacts
 
 ```python
