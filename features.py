@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from config import GOLD_ROUND_LEVELS
+from config import ROUND_LEVELS
 
 
 def ema(series: pd.Series, span: int) -> pd.Series:
@@ -61,9 +61,9 @@ def atr_percentile(atr_series: pd.Series, window: int = 100) -> pd.Series:
 
 
 def price_vs_round_numbers(close: pd.Series, levels: list = None) -> pd.DataFrame:
-    """Distance from price to nearest round numbers — Gold has strong round-number levels."""
+    """Distance from price to nearest round numbers for the active asset profile."""
     if levels is None:
-        levels = GOLD_ROUND_LEVELS
+        levels = ROUND_LEVELS
     result = {}
     for lvl in levels:
         remainder = close % lvl
@@ -177,7 +177,7 @@ def add_indicators(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
         out[f"{prefix}_vol_ratio"] = out["tick_volume"] / vol_ma
         out[f"{prefix}_vol_delta"] = out["tick_volume"].diff(1) / vol_ma
 
-    # Gold round number distances
+    # Asset round number distances
     rn = price_vs_round_numbers(out["close"])
     for col in rn.columns:
         out[f"{prefix}_{col}"] = rn[col]
@@ -249,6 +249,7 @@ def add_cross_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_base_features(df: pd.DataFrame) -> pd.DataFrame:
+    round_feature_cols = [f"M1_dist_round_{lvl}" for lvl in ROUND_LEVELS]
     cols = [
         "M1_ret_1", "M1_ret_3", "M1_ret_5", "M1_ret_10",
         "M1_ema_spread_9_20", "M1_ema_spread_20_50",
@@ -261,7 +262,7 @@ def get_base_features(df: pd.DataFrame) -> pd.DataFrame:
         "M1_macd", "M1_macd_signal", "M1_macd_hist",
         "M1_bb_width", "M1_bb_pctb",
         "M1_vol_ratio", "M1_vol_delta",
-        "M1_dist_round_10", "M1_dist_round_50", "M1_dist_round_100",
+        *round_feature_cols,
 
         "M5_ret_3", "M5_ema_spread_20_50", "M5_rsi_14", "M5_stoch_rsi",
         "M5_atr_pct", "M5_breakout_pos",

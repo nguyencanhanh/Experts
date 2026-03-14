@@ -92,6 +92,7 @@ def train_model(train_ds: SequenceDataset, valid_ds: SequenceDataset, input_size
     best_val_loss = float("inf")
     best_state = None
     patience_left = EARLY_STOPPING_PATIENCE
+    history = []
 
     total_batches = len(train_loader)
     print(f"Training on {DEVICE.upper()} | {total_batches} batches/epoch | batch_size={BATCH_SIZE}")
@@ -170,16 +171,27 @@ def train_model(train_ds: SequenceDataset, valid_ds: SequenceDataset, input_size
             best_val_loss = valid_loss
             best_state = copy.deepcopy(model.state_dict())
             patience_left = EARLY_STOPPING_PATIENCE
+            improved = True
         else:
             patience_left -= 1
+            improved = False
 
         # Restore original weights for continued training
         if ema is not None:
             ema.restore(model)
 
         epoch_time = time.time() - epoch_start
-        improved = "*" if valid_loss <= best_val_loss else ""
-        print(f"epoch={epoch+1}/{MAX_EPOCHS} train_loss={train_loss:.5f} valid_loss={valid_loss:.5f} time={epoch_time:.0f}s pat={patience_left} {improved}")
+        history.append({
+            "epoch": epoch + 1,
+            "train_loss": float(train_loss),
+            "valid_loss": float(valid_loss),
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "epoch_time_sec": float(epoch_time),
+            "patience_left": int(patience_left),
+            "improved": bool(improved),
+        })
+        improved_mark = "*" if improved else ""
+        print(f"epoch={epoch+1}/{MAX_EPOCHS} train_loss={train_loss:.5f} valid_loss={valid_loss:.5f} time={epoch_time:.0f}s pat={patience_left} {improved_mark}")
 
         if patience_left <= 0:
             print("Early stopping")
@@ -188,6 +200,8 @@ def train_model(train_ds: SequenceDataset, valid_ds: SequenceDataset, input_size
     if best_state is not None:
         model.load_state_dict(best_state)
 
+    model.training_history = history
+    model.best_val_loss = float(best_val_loss)
     return model
 
 

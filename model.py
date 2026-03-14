@@ -10,6 +10,53 @@ from config import (
 from utils import SwiGLU, DropPath
 
 
+def guess_transformer_heads(transformer_dim: int, preferred: int = None) -> int:
+    candidates = []
+    if preferred is not None:
+        candidates.append(preferred)
+    candidates.extend([4, 8, 6, 3, 2, 1])
+
+    seen = set()
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        if cand > 0 and transformer_dim % cand == 0:
+            return cand
+    return 1
+
+
+def infer_model_arch_from_state_dict(state_dict: dict, input_size: int = None) -> dict:
+    transformer_layers = sorted({
+        int(key.split(".")[1])
+        for key in state_dict
+        if key.startswith("transformer_layers.") and key.split(".")[1].isdigit()
+    })
+    bilstm_layers = sorted({
+        int(key.split("bilstm.weight_ih_l", 1)[1].split("_", 1)[0])
+        for key in state_dict
+        if key.startswith("bilstm.weight_ih_l")
+    })
+
+    inferred_input_size = input_size
+    if inferred_input_size is None:
+        inferred_input_size = int(state_dict["conv.conv3.weight"].shape[1])
+
+    transformer_dim = int(state_dict["ln_pre.weight"].shape[0])
+    return {
+        "input_size": inferred_input_size,
+        "num_classes": int(state_dict["head.4.weight"].shape[0]),
+        "cnn_channels": int(state_dict["conv.norm.weight"].shape[0]),
+        "lstm_hidden": int(state_dict["bilstm.weight_hh_l0"].shape[1]),
+        "lstm_layers": (max(bilstm_layers) + 1) if bilstm_layers else LSTM_LAYERS,
+        "dropout": DROPOUT,
+        "transformer_dim": transformer_dim,
+        "transformer_heads": guess_transformer_heads(transformer_dim, preferred=TRANSFORMER_HEADS),
+        "transformer_layers": (max(transformer_layers) + 1) if transformer_layers else TRANSFORMER_LAYERS,
+        "drop_path_rate": DROP_PATH_RATE,
+    }
+
+
 class LearnablePositionalEncoding(nn.Module):
     """Learnable positional encoding — adapts to data patterns."""
 
@@ -88,43 +135,63 @@ class AttentionPooling(nn.Module):
 
 
 class CNNBiLSTMTransformer(nn.Module):
-    def __init__(self, input_size: int, num_classes: int = 3):
+    def __init__(self, input_size: int, num_classes: int = 3,
+                 cnn_channels: int = CNN_CHANNELS,
+                 lstm_hidden: int = LSTM_HIDDEN,
+                 lstm_layers: int = LSTM_LAYERS,
+                 dropout: float = DROPOUT,
+                 transformer_dim: int = TRANSFORMER_DIM,
+                 transformer_heads: int = TRANSFORMER_HEADS,
+                 transformer_layers: int = TRANSFORMER_LAYERS,
+                 drop_path_rate: float = DROP_PATH_RATE):
         super().__init__()
+        self.arch_config = {
+            "input_size": input_size,
+            "num_classes": num_classes,
+            "cnn_channels": cnn_channels,
+            "lstm_hidden": lstm_hidden,
+            "lstm_layers": lstm_layers,
+            "dropout": dropout,
+            "transformer_dim": transformer_dim,
+            "transformer_heads": transformer_heads,
+            "transformer_layers": transformer_layers,
+            "drop_path_rate": drop_path_rate,
+        }
 
         # Multi-scale CNN
-        self.conv = MultiScaleConv(input_size, CNN_CHANNELS, DROPOUT)
-        self.se = SqueezeExcite(CNN_CHANNELS)
+        self.conv = MultiScaleConv(input_size, cnn_channels, dropout)
+        self.se = SqueezeExcite(cnn_channels)
         self.conv2 = nn.Sequential(
-            nn.Conv1d(CNN_CHANNELS, CNN_CHANNELS, kernel_size=3, padding=1),
-            nn.GELU(), nn.BatchNorm1d(CNN_CHANNELS), nn.Dropout(DROPOUT),
+            nn.Conv1d(cnn_channels, cnn_channels, kernel_size=3, padding=1),
+            nn.GELU(), nn.BatchNorm1d(cnn_channels), nn.Dropout(dropout),
         )
 
         # Projection + Learnable PE
-        self.proj = nn.Linear(CNN_CHANNELS, TRANSFORMER_DIM)
-        self.pos = LearnablePositionalEncoding(TRANSFORMER_DIM)
-        self.ln_pre = nn.LayerNorm(TRANSFORMER_DIM)
+        self.proj = nn.Linear(cnn_channels, transformer_dim)
+        self.pos = LearnablePositionalEncoding(transformer_dim)
+        self.ln_pre = nn.LayerNorm(transformer_dim)
 
         # SwiGLU Transformer with stochastic depth
-        dp_rates = [DROP_PATH_RATE * i / max(TRANSFORMER_LAYERS - 1, 1) for i in range(TRANSFORMER_LAYERS)]
+        dp_rates = [drop_path_rate * i / max(transformer_layers - 1, 1) for i in range(transformer_layers)]
         self.transformer_layers = nn.ModuleList([
-            SwiGLUTransformerLayer(TRANSFORMER_DIM, TRANSFORMER_HEADS, DROPOUT, dp_rates[i])
-            for i in range(TRANSFORMER_LAYERS)
+            SwiGLUTransformerLayer(transformer_dim, transformer_heads, dropout, dp_rates[i])
+            for i in range(transformer_layers)
         ])
 
         # BiLSTM
         self.bilstm = nn.LSTM(
-            input_size=TRANSFORMER_DIM, hidden_size=LSTM_HIDDEN, num_layers=LSTM_LAYERS,
-            dropout=DROPOUT if LSTM_LAYERS > 1 else 0.0, batch_first=True, bidirectional=True,
+            input_size=transformer_dim, hidden_size=lstm_hidden, num_layers=lstm_layers,
+            dropout=dropout if lstm_layers > 1 else 0.0, batch_first=True, bidirectional=True,
         )
 
-        lstm_out = LSTM_HIDDEN * 2
+        lstm_out = lstm_hidden * 2
         self.attn_pool = AttentionPooling(lstm_out)
-        self.skip_proj = nn.Linear(CNN_CHANNELS, lstm_out)
+        self.skip_proj = nn.Linear(cnn_channels, lstm_out)
 
         # Classification head
         self.head = nn.Sequential(
-            nn.LayerNorm(lstm_out), nn.Linear(lstm_out, LSTM_HIDDEN),
-            nn.GELU(), nn.Dropout(DROPOUT), nn.Linear(LSTM_HIDDEN, num_classes),
+            nn.LayerNorm(lstm_out), nn.Linear(lstm_out, lstm_hidden),
+            nn.GELU(), nn.Dropout(dropout), nn.Linear(lstm_hidden, num_classes),
         )
 
     def forward(self, x):

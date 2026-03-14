@@ -124,7 +124,14 @@ class DropPath(nn.Module):
 
 # ── IO Helpers ──
 
+def ensure_parent_dir(path: str):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
 def append_csv_row(path: str, row_dict: dict):
+    ensure_parent_dir(path)
     df = pd.DataFrame([row_dict])
     if os.path.exists(path):
         df.to_csv(path, mode="a", header=False, index=False)

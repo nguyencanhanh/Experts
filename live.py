@@ -1,37 +1,57 @@
-import os
 import time
-import json
-import joblib
-import torch
-import pytz
-import MetaTrader5 as mt5
-import numpy as np
 from datetime import datetime
 
-from config import (
-    SYMBOL, MODEL_PATH, SCALER_PATH, FEATURES_PATH, METRICS_PATH,
-    LIVE_BUY_THRESHOLD_OFFSET, LIVE_SELL_THRESHOLD_OFFSET,
-    MAX_SPREAD_POINTS, COOLDOWN_BARS, REJECT_COOLDOWN_BARS,
-    RISK_PER_TRADE, SL_ATR_MULT, USE_BREAK_EVEN,
-    USE_TRAILING_STOP, USE_PARTIAL_TP, PARTIAL_TP_R,
-    PARTIAL_CLOSE_RATIO, TRAILING_ATR_MULT,
-    LIVE_LOG_PATH, TIMEFRAMES, SEQ_LEN, DEVICE,
-    MAX_DAILY_LOSS_PCT, MAX_OPEN_POSITIONS, MAGIC,
-    MT5_RECONNECT_WAIT_SEC, HEARTBEAT_INTERVAL_SEC,
-    MAX_STALE_MINUTES, MAX_LATENCY_MS, MAX_POSITION_HOURS,
-    EQUITY_DRAWDOWN_STOP_PCT,
-)
-from utils import append_csv_row, FeatureScaler
-from data_mt5 import get_symbol_info, get_open_positions, get_recent_rates
-from features import add_indicators, merge_timeframes, add_cross_features, get_base_features
-from filters import (
-    is_in_sessions, is_in_news_window, compute_rr_from_proba,
-    regime_filter, context_side_allowed, confirm_entry, load_news_events,
-)
-from execution import place_market_order, modify_position_sl_tp, close_partial_position
+import MetaTrader5 as mt5
+import numpy as np
+import pytz
+
 from backtest import calc_lot_by_risk, round_volume
-from model import CNNBiLSTMTransformer
+from config import (
+    COOLDOWN_BARS,
+    DEVICE,
+    EQUITY_DRAWDOWN_STOP_PCT,
+    HEARTBEAT_INTERVAL_SEC,
+    LIVE_BUY_THRESHOLD_OFFSET,
+    LIVE_LOG_PATH,
+    LIVE_SELL_THRESHOLD_OFFSET,
+    MAGIC,
+    MAX_DAILY_LOSS_PCT,
+    MAX_LATENCY_MS,
+    MAX_OPEN_POSITIONS,
+    MAX_POSITION_HOURS,
+    MAX_SPREAD_POINTS,
+    MAX_STALE_MINUTES,
+    MT5_RECONNECT_WAIT_SEC,
+    NEWS_CSV_PATH,
+    PAPER_LIVE_LOG_PATH,
+    PARTIAL_CLOSE_RATIO,
+    PARTIAL_TP_R,
+    REJECT_COOLDOWN_BARS,
+    RISK_PER_TRADE,
+    SEQ_LEN,
+    SL_ATR_MULT,
+    SYMBOL,
+    TIMEFRAMES,
+    TRAILING_ATR_MULT,
+    USE_BREAK_EVEN,
+    USE_PARTIAL_TP,
+    USE_TRAILING_STOP,
+)
+from data_mt5 import get_open_positions, get_recent_rates, get_symbol_info
+from execution import close_partial_position, modify_position_sl_tp, place_market_order
+from features import add_cross_features, add_indicators, get_base_features, merge_timeframes
+from filters import (
+    compute_rr_from_proba,
+    confirm_entry,
+    context_side_allowed,
+    is_in_news_window,
+    is_in_sessions,
+    load_news_events,
+    regime_filter,
+)
+from save_load import load_inference_bundle
 from sequence_dataset import SequenceDataset
+from utils import append_csv_row
 
 
 def build_live_sequence_frame(symbol: str):
@@ -54,50 +74,39 @@ def build_live_sequence_frame(symbol: str):
 
 
 def check_data_stale(df, max_stale_minutes: int = MAX_STALE_MINUTES) -> bool:
-    """Check if data is stale (delayed more than max_stale_minutes)."""
     if len(df) == 0:
         return True
     last_time = df["time"].iloc[-1]
-    if hasattr(last_time, "tz_localize"):
-        now = datetime.now(pytz.UTC)
-    else:
-        now = np.datetime64("now")
-    age_minutes = (now - last_time).total_seconds() / 60.0 if hasattr(last_time, "total_seconds") else 999
     try:
         age_minutes = (datetime.now(pytz.UTC) - last_time.to_pydatetime()).total_seconds() / 60.0
     except Exception:
         return False
     if age_minutes > max_stale_minutes:
-        print(f"⚠️ Stale data: last bar is {age_minutes:.1f} min old")
+        print(f"Stale data: last bar is {age_minutes:.1f} min old")
         return True
     return False
 
 
 def build_live_sequence_inputs(df_live, seq_len, feature_cols, scaler):
-    """Build scaled 2D features and create SequenceDataset for live inference."""
     feat_df = get_base_features(df_live)
     feat_df = feat_df.dropna().reset_index(drop=True)
 
     df_aligned = df_live.iloc[-len(feat_df):].reset_index(drop=True).copy()
     arr = feat_df[feature_cols].values.astype("float32")
-
-    # Scale the 2D features
     scaled = scaler.transform(arr)
 
-    # Create dummy targets for the dataset
     n_seq = len(scaled) - seq_len + 1
     if n_seq <= 0:
         return None, None, None
 
     targets = np.zeros(n_seq, dtype=np.int64)
     ds = SequenceDataset(scaled, targets, seq_len, 0, n_seq)
-
     row_df = df_aligned.iloc[seq_len - 1:].reset_index(drop=True)
     return ds, row_df, scaled
 
 
-def log_reject(signal_time, reason, p_buy, p_sell, spread_points, row):
-    append_csv_row(LIVE_LOG_PATH, {
+def log_reject(signal_time, reason, p_buy, p_sell, spread_points, row, log_path: str):
+    append_csv_row(log_path, {
         "signal_time": str(signal_time),
         "event": reason,
         "p_buy": p_buy,
@@ -118,7 +127,6 @@ def check_daily_loss_exceeded(symbol: str) -> bool:
 
     utc = pytz.UTC
     today_start = datetime.now(utc).replace(hour=0, minute=0, second=0, microsecond=0)
-
     deals = mt5.history_deals_get(today_start, datetime.now(utc))
     if deals is None:
         deals = []
@@ -134,21 +142,18 @@ def check_daily_loss_exceeded(symbol: str) -> bool:
 
     loss_pct = abs(min(total_pnl, 0)) / max(account.balance, 1.0)
     if loss_pct >= MAX_DAILY_LOSS_PCT:
-        print(f"⚠️ Daily loss limit: {loss_pct:.2%} >= {MAX_DAILY_LOSS_PCT:.2%}")
+        print(f"Daily loss limit: {loss_pct:.2%} >= {MAX_DAILY_LOSS_PCT:.2%}")
         return True
     return False
 
 
 def check_equity_drawdown(symbol: str) -> bool:
-    """Check equity drawdown from balance — additional safety layer."""
     account = mt5.account_info()
-    if account is None:
-        return True
-    if account.balance <= 0:
+    if account is None or account.balance <= 0:
         return True
     dd = (account.balance - account.equity) / account.balance
     if dd >= EQUITY_DRAWDOWN_STOP_PCT:
-        print(f"⚠️ Equity drawdown: {dd:.2%} >= {EQUITY_DRAWDOWN_STOP_PCT:.2%}")
+        print(f"Equity drawdown: {dd:.2%} >= {EQUITY_DRAWDOWN_STOP_PCT:.2%}")
         return True
     return False
 
@@ -170,7 +175,6 @@ def ensure_mt5_connected() -> bool:
 
 
 def close_expired_positions(symbol: str, max_hours: float = MAX_POSITION_HOURS):
-    """Close positions that have been open too long without hitting TP/SL."""
     positions = get_open_positions(symbol)
     if not positions:
         return
@@ -181,13 +185,12 @@ def close_expired_positions(symbol: str, max_hours: float = MAX_POSITION_HOURS):
             open_time = datetime.fromtimestamp(pos.time, tz=pytz.UTC)
             hours_open = (now - open_time).total_seconds() / 3600.0
             if hours_open >= max_hours:
-                print(f"⏰ Position {pos.ticket} open {hours_open:.1f}h — closing (timeout)")
-                from execution import close_partial_position as _close
+                print(f"Position {pos.ticket} open {hours_open:.1f}h - closing (timeout)")
                 tick = mt5.symbol_info_tick(symbol)
                 if tick:
-                    _close(symbol, pos, pos.volume)
-        except Exception as e:
-            print(f"Error closing expired position: {e}")
+                    close_partial_position(symbol, pos, pos.volume)
+        except Exception as exc:
+            print(f"Error closing expired position: {exc}")
 
 
 def manage_open_positions(symbol: str):
@@ -196,8 +199,6 @@ def manage_open_positions(symbol: str):
         return
 
     symbol_info = get_symbol_info(symbol)
-    point = symbol_info.point
-
     df_live = build_live_sequence_frame(symbol)
     if len(df_live) < 5:
         return
@@ -219,13 +220,13 @@ def manage_open_positions(symbol: str):
 
         if pos.type == mt5.POSITION_TYPE_BUY:
             current_price = tick.bid
-            risk = max(entry - sl, point)
+            risk = max(entry - sl, symbol_info.point)
             current_profit_r = (current_price - entry) / risk
             candidate_trailing_sl = current_price - atr_now * TRAILING_ATR_MULT
             side = 1
         else:
             current_price = tick.ask
-            risk = max(sl - entry, point) if sl > 0 else point
+            risk = max(sl - entry, symbol_info.point) if sl > 0 else symbol_info.point
             current_profit_r = (entry - current_price) / risk
             candidate_trailing_sl = current_price + atr_now * TRAILING_ATR_MULT
             side = 2
@@ -250,83 +251,72 @@ def manage_open_positions(symbol: str):
 
 
 def predict_live(model, ds, batch_size=1024):
-    """Predict probabilities for live data using SequenceDataset."""
     from trainer import predict_proba
     return predict_proba(model, ds, batch_size=batch_size)
 
 
-def run_live():
-    if not (os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH) and os.path.exists(FEATURES_PATH) and os.path.exists(METRICS_PATH)):
-        raise RuntimeError("Thiếu model/scaler/features/metrics. Hãy train trước.")
-
-    checkpoint = torch.load(MODEL_PATH, map_location=DEVICE)
-    scaler = joblib.load(SCALER_PATH)
-    feature_cols = joblib.load(FEATURES_PATH)
-
-    model = CNNBiLSTMTransformer(input_size=len(feature_cols)).to(DEVICE)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-
-    with open(METRICS_PATH, "r", encoding="utf-8") as f:
-        metrics = json.load(f)
+def run_live(paper_mode: bool = False):
+    artifact = load_inference_bundle(DEVICE)
+    model = artifact["model"]
+    scaler = artifact["scaler"]
+    feature_cols = artifact["feature_cols"]
+    metrics = artifact["metrics"]
+    log_path = PAPER_LIVE_LOG_PATH if paper_mode else LIVE_LOG_PATH
 
     buy_threshold = min(float(metrics["best_buy_threshold"]) + LIVE_BUY_THRESHOLD_OFFSET, 0.75)
     sell_threshold = min(float(metrics["best_sell_threshold"]) + LIVE_SELL_THRESHOLD_OFFSET, 0.75)
 
     symbol_info = get_symbol_info(SYMBOL)
-    news_df = load_news_events("news_events.csv")
+    news_df = load_news_events(NEWS_CSV_PATH)
 
     last_signal_bar_time = None
     last_trade_time = None
     last_reject_time = None
     last_heartbeat = time.time()
 
-    print(f"Live V7 started | buy_th={buy_threshold} sell_th={sell_threshold}")
-    print(f"Safety: max_daily_loss={MAX_DAILY_LOSS_PCT:.1%} max_positions={MAX_OPEN_POSITIONS}")
-    print(f"        equity_dd_stop={EQUITY_DRAWDOWN_STOP_PCT:.1%} position_timeout={MAX_POSITION_HOURS}h")
-    print(f"        max_latency={MAX_LATENCY_MS}ms max_stale={MAX_STALE_MINUTES}min")
+    mode_label = "Paper live" if paper_mode else "Live V7"
+    print(f"{mode_label} started | buy_th={buy_threshold} sell_th={sell_threshold}")
+    if paper_mode:
+        print("Paper mode: no MT5 orders will be sent; signals are logged only.")
+    else:
+        print(f"Safety: max_daily_loss={MAX_DAILY_LOSS_PCT:.1%} max_positions={MAX_OPEN_POSITIONS}")
+        print(f"        equity_dd_stop={EQUITY_DRAWDOWN_STOP_PCT:.1%} position_timeout={MAX_POSITION_HOURS}h")
+        print(f"        max_latency={MAX_LATENCY_MS}ms max_stale={MAX_STALE_MINUTES}min")
 
     while True:
         try:
             ensure_mt5_connected()
 
-            # Heartbeat
             if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
                 account = mt5.account_info()
                 bal = account.balance if account else 0
                 eq = account.equity if account else 0
-                print(f"♥ Heartbeat | balance={bal:.2f} equity={eq:.2f} | {datetime.now()}")
+                print(f"Heartbeat | balance={bal:.2f} equity={eq:.2f} | {datetime.now()}")
                 last_heartbeat = time.time()
 
-            # Safety checks
-            if check_daily_loss_exceeded(SYMBOL):
-                time.sleep(60)
-                continue
+            if not paper_mode:
+                if check_daily_loss_exceeded(SYMBOL):
+                    time.sleep(60)
+                    continue
 
-            if check_equity_drawdown(SYMBOL):
-                time.sleep(60)
-                continue
+                if check_equity_drawdown(SYMBOL):
+                    time.sleep(60)
+                    continue
 
-            # Close expired positions
-            close_expired_positions(SYMBOL)
-
-            manage_open_positions(SYMBOL)
+                close_expired_positions(SYMBOL)
+                manage_open_positions(SYMBOL)
 
             df_live = build_live_sequence_frame(SYMBOL)
-
-            # Stale data check
             if check_data_stale(df_live):
                 time.sleep(10)
                 continue
 
-            ds, row_df, scaled = build_live_sequence_inputs(df_live, SEQ_LEN, feature_cols, scaler)
-
+            ds, row_df, _ = build_live_sequence_inputs(df_live, SEQ_LEN, feature_cols, scaler)
             if ds is None or len(ds) < 20:
                 time.sleep(2)
                 continue
 
             probs = predict_live(model, ds)
-
             signal_idx = len(row_df) - 2
             signal_row = row_df.iloc[signal_idx]
             signal_time = signal_row["time"]
@@ -357,16 +347,16 @@ def run_live():
 
             spread_points = (tick.ask - tick.bid) / symbol_info.point
             if spread_points > MAX_SPREAD_POINTS:
-                log_reject(signal_time, "reject_spread", 0.0, 0.0, spread_points, signal_row)
+                log_reject(signal_time, "reject_spread", 0.0, 0.0, spread_points, signal_row, log_path=log_path)
                 last_reject_time = signal_time
                 time.sleep(2)
                 continue
 
-            # Max positions check
-            positions = get_open_positions(SYMBOL)
-            if len(positions) >= MAX_OPEN_POSITIONS:
-                time.sleep(2)
-                continue
+            if not paper_mode:
+                positions = get_open_positions(SYMBOL)
+                if len(positions) >= MAX_OPEN_POSITIONS:
+                    time.sleep(2)
+                    continue
 
             if last_trade_time is not None:
                 bars_since = int((signal_time - last_trade_time).total_seconds() // 60)
@@ -388,43 +378,43 @@ def run_live():
                 pred_prob = p_sell
 
             if side == 0:
-                log_reject(signal_time, "reject_threshold", p_buy, p_sell, spread_points, signal_row)
+                log_reject(signal_time, "reject_threshold", p_buy, p_sell, spread_points, signal_row, log_path=log_path)
                 time.sleep(2)
                 continue
 
             if not context_side_allowed(signal_row, side):
-                log_reject(signal_time, "reject_context", p_buy, p_sell, spread_points, signal_row)
+                log_reject(signal_time, "reject_context", p_buy, p_sell, spread_points, signal_row, log_path=log_path)
                 last_reject_time = signal_time
                 time.sleep(2)
                 continue
 
             if not regime_filter(signal_row):
-                log_reject(signal_time, "reject_regime", p_buy, p_sell, spread_points, signal_row)
+                log_reject(signal_time, "reject_regime", p_buy, p_sell, spread_points, signal_row, log_path=log_path)
                 last_reject_time = signal_time
                 time.sleep(2)
                 continue
 
             confirm_window = row_df.iloc[max(0, signal_idx - 4):signal_idx + 1].copy()
             if not confirm_entry(confirm_window, side):
-                log_reject(signal_time, "reject_confirm", p_buy, p_sell, spread_points, signal_row)
+                log_reject(signal_time, "reject_confirm", p_buy, p_sell, spread_points, signal_row, log_path=log_path)
                 last_reject_time = signal_time
                 time.sleep(2)
                 continue
 
             atr_now = float(signal_row["M1_atr_14"])
             if not (atr_now > 0):
-                log_reject(signal_time, "reject_atr", p_buy, p_sell, spread_points, signal_row)
+                log_reject(signal_time, "reject_atr", p_buy, p_sell, spread_points, signal_row, log_path=log_path)
                 time.sleep(2)
                 continue
 
-            # Re-check spread right before order (race condition mitigation)
             tick = mt5.symbol_info_tick(SYMBOL)
             if tick is None:
                 time.sleep(2)
                 continue
+
             spread_points_now = (tick.ask - tick.bid) / symbol_info.point
             if spread_points_now > MAX_SPREAD_POINTS:
-                log_reject(signal_time, "reject_spread_recheck", p_buy, p_sell, spread_points_now, signal_row)
+                log_reject(signal_time, "reject_spread_recheck", p_buy, p_sell, spread_points_now, signal_row, log_path=log_path)
                 last_reject_time = signal_time
                 time.sleep(2)
                 continue
@@ -448,37 +438,57 @@ def run_live():
                 sl = entry + sl_dist
                 tp = entry - sl_dist * rr
 
-            t_start = time.time()
-            result = place_market_order(SYMBOL, side, volume, sl, tp)
-            latency_ms = (time.time() - t_start) * 1000
-
-            # Latency guard
-            if latency_ms > MAX_LATENCY_MS:
-                print(f"⚠️ High latency: {latency_ms:.0f}ms (max={MAX_LATENCY_MS}ms)")
-
-            append_csv_row(LIVE_LOG_PATH, {
-                "signal_time": str(signal_time),
-                "event": "order_send",
-                "side": "BUY" if side == 1 else "SELL",
-                "p_buy": p_buy, "p_sell": p_sell,
-                "pred_prob": pred_prob, "rr": rr,
-                "volume": volume,
-                "retcode": getattr(result, "retcode", None) if result is not None else None,
-                "comment": getattr(result, "comment", "") if result is not None else "None",
-                "order": getattr(result, "order", None) if result is not None else None,
-                "deal": getattr(result, "deal", None) if result is not None else None,
-                "spread_points": spread_points_now,
-                "latency_ms": round(latency_ms, 1),
-            })
-
-            if result is not None and getattr(result, "retcode", None) == 10009:
+            if paper_mode:
+                append_csv_row(log_path, {
+                    "signal_time": str(signal_time),
+                    "event": "paper_order",
+                    "side": "BUY" if side == 1 else "SELL",
+                    "p_buy": p_buy,
+                    "p_sell": p_sell,
+                    "pred_prob": pred_prob,
+                    "rr": rr,
+                    "volume": volume,
+                    "entry": entry,
+                    "sl": sl,
+                    "tp": tp,
+                    "spread_points": spread_points_now,
+                    "comment": "paper mode - no MT5 order sent",
+                })
+                print(f"PAPER ORDER | {signal_time} | {'BUY' if side == 1 else 'SELL'} | prob={pred_prob:.3f} | rr={rr:.2f}")
                 last_trade_time = signal_time
+            else:
+                t_start = time.time()
+                result = place_market_order(SYMBOL, side, volume, sl, tp)
+                latency_ms = (time.time() - t_start) * 1000
+
+                if latency_ms > MAX_LATENCY_MS:
+                    print(f"High latency: {latency_ms:.0f}ms (max={MAX_LATENCY_MS}ms)")
+
+                append_csv_row(log_path, {
+                    "signal_time": str(signal_time),
+                    "event": "order_send",
+                    "side": "BUY" if side == 1 else "SELL",
+                    "p_buy": p_buy,
+                    "p_sell": p_sell,
+                    "pred_prob": pred_prob,
+                    "rr": rr,
+                    "volume": volume,
+                    "retcode": getattr(result, "retcode", None) if result is not None else None,
+                    "comment": getattr(result, "comment", "") if result is not None else "None",
+                    "order": getattr(result, "order", None) if result is not None else None,
+                    "deal": getattr(result, "deal", None) if result is not None else None,
+                    "spread_points": spread_points_now,
+                    "latency_ms": round(latency_ms, 1),
+                })
+
+                if result is not None and getattr(result, "retcode", None) == 10009:
+                    last_trade_time = signal_time
 
             time.sleep(2)
 
         except KeyboardInterrupt:
-            print("Dừng live V7")
+            print("Dung live")
             break
-        except Exception as e:
-            print(f"ERROR: {e}")
+        except Exception as exc:
+            print(f"ERROR: {exc}")
             time.sleep(5)

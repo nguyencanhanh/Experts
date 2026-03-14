@@ -57,15 +57,21 @@ class SequenceDataset(Dataset):
         return self.targets[self.start:self.start + self.count].copy()
 
 
-def build_sequence_bundle(df: pd.DataFrame, seq_len: int = SEQ_LEN) -> SequenceBundle:
+def build_sequence_bundle(df: pd.DataFrame, seq_len: int = SEQ_LEN, point_size: float = None) -> SequenceBundle:
     df = df.copy()
-    df["target"] = build_labels_no_lookahead(df)
+    df["target"] = build_labels_no_lookahead(df, point_size=point_size)
 
     feat_df = get_base_features(df)
-    full_df = pd.concat(
-        [df[["time", "open", "high", "low", "close", "tick_volume", "spread", "target"]], feat_df],
-        axis=1,
-    )
+    row_meta_cols = [
+        "time", "open", "high", "low", "close", "tick_volume", "spread", "target",
+        # Backtest/live filters use these raw indicator columns directly.
+        "M1_ema_20", "M1_atr_14", "M1_atr_pct",
+        "M15_ema_spread_20_50", "H1_ema_spread_20_50",
+        "M15_trend_up_20_50", "H1_trend_up_20_50",
+        "buy_context_score", "sell_context_score",
+    ]
+    selected_cols = row_meta_cols + [c for c in feat_df.columns if c not in row_meta_cols]
+    full_df = df[selected_cols].copy()
     full_df = full_df.dropna().reset_index(drop=True)
 
     feature_cols = list(feat_df.columns)

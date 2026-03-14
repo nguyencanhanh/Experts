@@ -1,3 +1,4 @@
+import os
 import json
 import joblib
 import torch
@@ -9,6 +10,8 @@ from config import (
     WF_PATH, WF_TRADES_PATH, WF_EQUITY_PATH, SEQ_LEN,
 )
 from features import get_base_features
+from model import CNNBiLSTMTransformer, infer_model_arch_from_state_dict
+from utils import ensure_parent_dir
 
 
 def save_outputs(model, scaler, feature_cols: list, metrics: dict, df_full: pd.DataFrame,
@@ -18,8 +21,19 @@ def save_outputs(model, scaler, feature_cols: list, metrics: dict, df_full: pd.D
                  wf_trades_df: pd.DataFrame = None,
                  wf_equity_df: pd.DataFrame = None,
                  wf_summary: dict = None):
+    for path in [
+        MODEL_PATH, SCALER_PATH, FEATURES_PATH, METRICS_PATH,
+        DATASET_PATH, BT_TRADES_PATH, BT_SUMMARY_PATH, BT_EQUITY_PATH,
+        WF_PATH, WF_TRADES_PATH, WF_EQUITY_PATH,
+    ]:
+        ensure_parent_dir(path)
+
     torch.save(
-        {"model_state_dict": model.state_dict(), "input_size": len(feature_cols)},
+        {
+            "model_state_dict": model.state_dict(),
+            "input_size": len(feature_cols),
+            "model_arch": getattr(model, "arch_config", None),
+        },
         MODEL_PATH,
     )
 
@@ -58,3 +72,51 @@ def save_outputs(model, scaler, feature_cols: list, metrics: dict, df_full: pd.D
             wf_trades_df.to_csv(WF_TRADES_PATH, index=False)
         if wf_equity_df is not None and len(wf_equity_df) > 0:
             wf_equity_df.to_csv(WF_EQUITY_PATH, index=False)
+
+
+def load_inference_bundle(device: str):
+    if not (all([
+        MODEL_PATH,
+        SCALER_PATH,
+        FEATURES_PATH,
+        METRICS_PATH,
+    ])):
+        raise RuntimeError("Artifact paths are not configured.")
+
+    missing = [path for path in [MODEL_PATH, SCALER_PATH, FEATURES_PATH, METRICS_PATH] if not os.path.exists(path)]
+    if missing:
+        raise RuntimeError(f"Missing artifacts: {', '.join(missing)}")
+
+    checkpoint = torch.load(MODEL_PATH, map_location=device)
+    scaler = joblib.load(SCALER_PATH)
+    feature_cols = joblib.load(FEATURES_PATH)
+
+    with open(METRICS_PATH, "r", encoding="utf-8") as f:
+        metrics = json.load(f)
+
+    state_dict = checkpoint["model_state_dict"]
+    model_arch = checkpoint.get("model_arch")
+    if model_arch is None:
+        model_arch = infer_model_arch_from_state_dict(
+            state_dict,
+            input_size=checkpoint.get("input_size", len(feature_cols)),
+        )
+
+    checkpoint_input_size = int(model_arch.get("input_size", checkpoint.get("input_size", len(feature_cols))))
+    if checkpoint_input_size != len(feature_cols):
+        raise RuntimeError(
+            f"Feature count mismatch: checkpoint expects {checkpoint_input_size}, "
+            f"but features file has {len(feature_cols)} columns."
+        )
+
+    model = CNNBiLSTMTransformer(**model_arch).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return {
+        "model": model,
+        "scaler": scaler,
+        "feature_cols": feature_cols,
+        "metrics": metrics,
+        "checkpoint": checkpoint,
+        "model_arch": model_arch,
+    }
