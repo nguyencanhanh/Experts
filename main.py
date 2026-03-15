@@ -14,7 +14,11 @@ from features import add_cross_features, add_indicators, get_base_features, merg
 from filters import load_news_events
 from live import run_live
 from save_load import load_inference_bundle, save_outputs
-from sequence_dataset import SequenceDataset, build_sequence_bundle
+from sequence_dataset import (
+    SequenceDataset,
+    build_purged_four_way_split,
+    build_sequence_bundle,
+)
 from trainer import evaluate, predict_proba, train_model
 from utils import FeatureScaler, set_seed
 
@@ -109,28 +113,32 @@ def train_pipeline(run_backtest: bool = True, run_wf: bool = True):
     #   CALIB  (10%): optimize_thresholds — model CHƯA BAO GIỜ thấy trong training
     #   TEST   (15%): đánh giá cuối cùng
     # ──────────────────────────────────────────────────────────────────────────
-    train_end = int(n * TRAIN_RATIO)
-    valid_end = train_end + int(n * VALID_RATIO)
-    calib_end = valid_end + int(n * CALIB_RATIO)
-
+    splits = build_purged_four_way_split(
+        n,
+        train_ratio=TRAIN_RATIO,
+        valid_ratio=VALID_RATIO,
+        calib_ratio=CALIB_RATIO,
+        seq_len=bundle.seq_len,
+    )
     print(f"\nData split:")
-    print(f"  Train : [{0:6d}, {train_end:6d}) = {train_end} sequences ({TRAIN_RATIO:.0%})")
-    print(f"  Valid : [{train_end:6d}, {valid_end:6d}) = {valid_end-train_end} sequences ({VALID_RATIO:.0%}) — early stopping")
-    print(f"  Calib : [{valid_end:6d}, {calib_end:6d}) = {calib_end-valid_end} sequences ({CALIB_RATIO:.0%}) — threshold opt")
-    print(f"  Test  : [{calib_end:6d}, {n:6d}) = {n-calib_end} sequences ({1-TRAIN_RATIO-VALID_RATIO-CALIB_RATIO:.0%})")
+    print(f"  Purge gap : {splits.purge_gap} sequences between segments")
+    print(f"  Train : [{splits.train.start:6d}, {splits.train.end:6d}) = {splits.train.count} sequences ({TRAIN_RATIO:.0%} of usable)")
+    print(f"  Valid : [{splits.valid.start:6d}, {splits.valid.end:6d}) = {splits.valid.count} sequences ({VALID_RATIO:.0%} of usable) — early stopping")
+    print(f"  Calib : [{splits.calib.start:6d}, {splits.calib.end:6d}) = {splits.calib.count} sequences ({CALIB_RATIO:.0%} of usable) — threshold opt")
+    print(f"  Test  : [{splits.test.start:6d}, {splits.test.end:6d}) = {splits.test.count} sequences ({1-TRAIN_RATIO-VALID_RATIO-CALIB_RATIO:.0%} of usable)")
 
     # Scaler fit CHỈ trên train
     scaler = FeatureScaler()
-    scaler.fit(bundle.features[:train_end + bundle.seq_len - 1])
+    scaler.fit(bundle.features[:splits.train.end + bundle.seq_len - 1])
     scaled = scaler.transform(bundle.features)
 
-    train_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, 0, train_end)
-    valid_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, train_end, valid_end - train_end)
-    calib_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, valid_end, calib_end - valid_end)
-    test_ds  = SequenceDataset(scaled, bundle.targets, bundle.seq_len, calib_end, n - calib_end)
+    train_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, splits.train.start, splits.train.count)
+    valid_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, splits.valid.start, splits.valid.count)
+    calib_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, splits.calib.start, splits.calib.count)
+    test_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, splits.test.start, splits.test.count)
 
-    row_df_calib = bundle.row_df.iloc[valid_end:calib_end].reset_index(drop=True)
-    row_df_test  = bundle.row_df.iloc[calib_end:].reset_index(drop=True)
+    row_df_calib = bundle.row_df.iloc[splits.calib.start:splits.calib.end].reset_index(drop=True)
+    row_df_test = bundle.row_df.iloc[splits.test.start:splits.test.end].reset_index(drop=True)
 
     # Train model chính
     model = train_model(train_ds, valid_ds, input_size=bundle.features.shape[-1])
@@ -165,13 +173,13 @@ def train_pipeline(run_backtest: bool = True, run_wf: bool = True):
     # Threshold được tối ưu trên calib segment = honest out-of-sample estimate.
     # ──────────────────────────────────────────────────────────────────────────
     deploy_scaler = FeatureScaler()
-    deploy_scaler.fit(bundle.features[:calib_end + bundle.seq_len - 1])
+    deploy_scaler.fit(bundle.features[:splits.valid.end + bundle.seq_len - 1])
     deploy_scaled = deploy_scaler.transform(bundle.features)
 
     # Deploy train = train+valid (model chưa thấy valid trong lúc "fit" nhưng valid
     # được dùng cho early stopping → dùng calib làm valid của deploy để tránh biết trước)
-    deploy_train_ds = SequenceDataset(deploy_scaled, bundle.targets, bundle.seq_len, 0, valid_end)
-    deploy_valid_ds = SequenceDataset(deploy_scaled, bundle.targets, bundle.seq_len, valid_end, calib_end - valid_end)
+    deploy_train_ds = SequenceDataset(deploy_scaled, bundle.targets, bundle.seq_len, 0, splits.valid.end)
+    deploy_valid_ds = SequenceDataset(deploy_scaled, bundle.targets, bundle.seq_len, splits.calib.start, splits.calib.count)
     deploy_model = train_model(deploy_train_ds, deploy_valid_ds, input_size=bundle.features.shape[-1])
 
     # Threshold cho deploy model: chạy lại optimize trên calib (dữ liệu sạch)
@@ -200,10 +208,11 @@ def train_pipeline(run_backtest: bool = True, run_wf: bool = True):
         "symbol": SYMBOL,
         "profile": PROFILE_NAME,
         "rows_total": int(n),
-        "rows_train": int(train_end),
-        "rows_valid": int(valid_end - train_end),
-        "rows_calib": int(calib_end - valid_end),
-        "rows_test": int(n - calib_end),
+        "rows_train": int(splits.train.count),
+        "rows_valid": int(splits.valid.count),
+        "rows_calib": int(splits.calib.count),
+        "rows_test": int(splits.test.count),
+        "purge_gap_sequences": int(splits.purge_gap),
         "training_history": getattr(model, "training_history", []),
         "training_best_val_loss": getattr(model, "best_val_loss", None),
         "deploy_training_history": getattr(deploy_model, "training_history", []),
@@ -271,15 +280,17 @@ def backtest_only_pipeline():
 
     bundle = build_sequence_bundle(df)
     n = bundle.n_sequences
-    train_end = int(n * TRAIN_RATIO)
-    valid_end = train_end + int(n * VALID_RATIO)
-    calib_end = valid_end + int(n * CALIB_RATIO)
-    if calib_end >= n:
-        raise RuntimeError("Not enough sequences to build a backtest split.")
+    splits = build_purged_four_way_split(
+        n,
+        train_ratio=TRAIN_RATIO,
+        valid_ratio=VALID_RATIO,
+        calib_ratio=CALIB_RATIO,
+        seq_len=bundle.seq_len,
+    )
 
     scaled = scaler.transform(bundle.features)
-    test_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, calib_end, n - calib_end)
-    row_df_test = bundle.row_df.iloc[calib_end:].reset_index(drop=True)
+    test_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, splits.test.start, splits.test.count)
+    row_df_test = bundle.row_df.iloc[splits.test.start:splits.test.end].reset_index(drop=True)
 
     best_buy  = float(metrics.get("best_buy_threshold", 0.0))
     best_sell = float(metrics.get("best_sell_threshold", 0.0))
@@ -296,10 +307,11 @@ def backtest_only_pipeline():
         "symbol": SYMBOL,
         "profile": PROFILE_NAME,
         "rows_total": int(n),
-        "rows_train": int(train_end),
-        "rows_valid": int(valid_end - train_end),
-        "rows_calib": int(calib_end - valid_end),
-        "rows_test": int(n - calib_end),
+        "rows_train": int(splits.train.count),
+        "rows_valid": int(splits.valid.count),
+        "rows_calib": int(splits.calib.count),
+        "rows_test": int(splits.test.count),
+        "purge_gap_sequences": int(splits.purge_gap),
         "eval_test": eval_test,
         "test_backtest_summary": test_summary,
         "backtest_source": "saved_model",

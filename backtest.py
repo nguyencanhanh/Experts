@@ -14,6 +14,7 @@ from filters import (
     is_in_sessions, is_in_news_window, compute_rr_from_proba,
     regime_filter, context_side_allowed, confirm_entry,
 )
+from sequence_dataset import build_purged_train_valid_window
 
 
 def round_volume(volume: float, volume_step: float, volume_min: float, volume_max: float) -> float:
@@ -360,31 +361,35 @@ def run_walkforward(bundle, trainer_predict_fn, trainer_train_fn, symbol_info, n
 
     while True:
         train_start = start
-        train_end = train_start + WF_TRAIN_BARS
-        test_start = train_end
+        train_window = build_purged_train_valid_window(
+            WF_TRAIN_BARS,
+            valid_ratio=0.15,
+            seq_len=seq_len,
+            horizon=HORIZON_BARS,
+        )
+        train_split = train_window.train.shifted(train_start)
+        valid_split = train_window.valid.shifted(train_start)
+        train_window_end = train_start + WF_TRAIN_BARS
+        test_start = train_window_end + train_window.purge_gap
         test_end = test_start + WF_TEST_BARS
 
         if test_end > bundle.n_sequences:
             break
 
         # Fit scaler on training features (2D)
-        feat_start = train_start
-        feat_end = train_end + seq_len - 1
+        feat_start = train_split.start
+        feat_end = train_split.end + seq_len - 1
         scaler = FeatureScaler()
         scaler.fit(bundle.features[feat_start:feat_end])
 
         # Scale all features
         scaled = scaler.transform(bundle.features)
 
-        # Split train/valid
-        valid_cut = int((train_end - train_start) * 0.85)
-        actual_valid_start = train_start + valid_cut
-
-        train_ds = SequenceDataset(scaled, bundle.targets, seq_len, train_start, valid_cut)
-        valid_ds = SequenceDataset(scaled, bundle.targets, seq_len, actual_valid_start, train_end - actual_valid_start)
+        train_ds = SequenceDataset(scaled, bundle.targets, seq_len, train_split.start, train_split.count)
+        valid_ds = SequenceDataset(scaled, bundle.targets, seq_len, valid_split.start, valid_split.count)
         test_ds = SequenceDataset(scaled, bundle.targets, seq_len, test_start, test_end - test_start)
 
-        row_df_valid = bundle.row_df.iloc[actual_valid_start:train_end].reset_index(drop=True)
+        row_df_valid = bundle.row_df.iloc[valid_split.start:valid_split.end].reset_index(drop=True)
         row_df_test = bundle.row_df.iloc[test_start:test_end].reset_index(drop=True)
 
         model = trainer_train_fn(train_ds, valid_ds, input_size=bundle.features.shape[-1])
@@ -401,10 +406,13 @@ def run_walkforward(bundle, trainer_predict_fn, trainer_train_fn, symbol_info, n
         )
 
         summary["window_id"] = window_id
-        summary["train_start_idx"] = train_start
-        summary["train_end_idx"] = train_end
+        summary["train_start_idx"] = train_split.start
+        summary["train_end_idx"] = train_split.end
+        summary["valid_start_idx"] = valid_split.start
+        summary["valid_end_idx"] = valid_split.end
         summary["test_start_idx"] = test_start
         summary["test_end_idx"] = test_end
+        summary["purge_gap_sequences"] = train_window.purge_gap
         wf_results.append(summary)
 
         if len(trades_df) > 0:

@@ -44,10 +44,10 @@ def _slugify(value: str) -> str:
     return "".join(ch.lower() for ch in value if ch.isalnum())
 
 
-SYMBOL = (os.getenv("TRADE_BOT_SYMBOL") or "XAUUSD").strip().upper()
+SYMBOL = (os.getenv("TRADE_BOT_SYMBOL") or "BTCUSD").strip().upper()
 YEARS_BACK = _env_int("TRADE_BOT_YEARS_BACK", 1)
 ARTIFACT_VERSION = (os.getenv("TRADE_BOT_ARTIFACT_VERSION") or "v7").strip() or "v7"
-PROFILE_NAME = (os.getenv("TRADE_BOT_PROFILE") or "base").strip().lower() or "base"
+PROFILE_NAME = (os.getenv("TRADE_BOT_PROFILE") or "btc_active").strip().lower() or "btc_active"
 SYMBOL_SLUG = _slugify(SYMBOL)
 PROFILE_SLUG = _slugify(PROFILE_NAME)
 ARTIFACT_PREFIX = f"{SYMBOL_SLUG}_{ARTIFACT_VERSION}" + (f"_{PROFILE_SLUG}" if PROFILE_NAME != "base" else "")
