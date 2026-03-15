@@ -50,7 +50,7 @@ try {
     $env:TRADE_BOT_ARTIFACT_VERSION = $ArtifactVersion.Trim()
 
     Write-Host "Running main.py | symbol=$($env:TRADE_BOT_SYMBOL) profile=$($env:TRADE_BOT_PROFILE) years_back=$($env:TRADE_BOT_YEARS_BACK) mode=$Mode"
-    & python .\main.py --mode $Mode
+    & py .\main.py --mode $Mode
 }
 finally {
     Pop-Location

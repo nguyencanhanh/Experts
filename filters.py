@@ -9,6 +9,10 @@ from config import (
 )
 
 
+def empty_news_events_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=["time_utc", "impact", "currency", "title"])
+
+
 def parse_hhmm(s: str):
     hh, mm = s.split(":")
     return int(hh), int(mm)
@@ -29,15 +33,29 @@ def is_in_sessions(ts_utc: pd.Timestamp) -> bool:
 
 
 def load_news_events(path: str) -> pd.DataFrame:
+    if not USE_NEWS_FILTER:
+        return empty_news_events_df()
+
     try:
         news = pd.read_csv(path)
     except FileNotFoundError:
-        return pd.DataFrame(columns=["time_utc", "impact", "currency", "title"])
+        return empty_news_events_df()
+    except pd.errors.EmptyDataError:
+        return empty_news_events_df()
 
     if "time_utc" not in news.columns:
         raise ValueError("news_events.csv phải có cột time_utc")
 
-    news["time_utc"] = pd.to_datetime(news["time_utc"], utc=True)
+    news["time_utc"] = pd.to_datetime(
+        news["time_utc"],
+        utc=True,
+        errors="coerce",
+        format="mixed",
+    )
+    if news["time_utc"].isna().any():
+        invalid = int(news["time_utc"].isna().sum())
+        print(f"[NEWS] Dropping {invalid} rows with invalid time_utc from {path}")
+        news = news.loc[~news["time_utc"].isna()].copy()
     news["impact"] = news.get("impact", "high").astype(str).str.lower()
     news["currency"] = news.get("currency", "").astype(str)
     news["title"] = news.get("title", "").astype(str)

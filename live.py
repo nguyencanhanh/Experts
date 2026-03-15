@@ -263,8 +263,23 @@ def run_live(paper_mode: bool = False):
     metrics = artifact["metrics"]
     log_path = PAPER_LIVE_LOG_PATH if paper_mode else LIVE_LOG_PATH
 
-    buy_threshold = min(float(metrics["best_buy_threshold"]) + LIVE_BUY_THRESHOLD_OFFSET, 0.75)
-    sell_threshold = min(float(metrics["best_sell_threshold"]) + LIVE_SELL_THRESHOLD_OFFSET, 0.75)
+    # ── Tính threshold từ metrics đã lưu ──
+    raw_buy = float(metrics["best_buy_threshold"])
+    raw_sell = float(metrics["best_sell_threshold"])
+    buy_threshold = raw_buy + LIVE_BUY_THRESHOLD_OFFSET
+    sell_threshold = raw_sell + LIVE_SELL_THRESHOLD_OFFSET
+
+    # Safety guard: không bao giờ cho phép threshold dưới 0.55
+    # (phòng khi model cũ với threshold thấp vẫn còn được load)
+    MIN_LIVE_THRESHOLD = 0.55
+    if buy_threshold < MIN_LIVE_THRESHOLD:
+        print(f"[WARNING] buy_threshold ({buy_threshold:.3f}) quá thấp, nâng lên {MIN_LIVE_THRESHOLD}")
+        buy_threshold = MIN_LIVE_THRESHOLD
+    if sell_threshold < MIN_LIVE_THRESHOLD:
+        print(f"[WARNING] sell_threshold ({sell_threshold:.3f}) quá thấp, nâng lên {MIN_LIVE_THRESHOLD}")
+        sell_threshold = MIN_LIVE_THRESHOLD
+    buy_threshold = min(buy_threshold, 0.80)
+    sell_threshold = min(sell_threshold, 0.80)
 
     symbol_info = get_symbol_info(SYMBOL)
     news_df = load_news_events(NEWS_CSV_PATH)
@@ -275,13 +290,14 @@ def run_live(paper_mode: bool = False):
     last_heartbeat = time.time()
 
     mode_label = "Paper live" if paper_mode else "Live V7"
-    print(f"{mode_label} started | buy_th={buy_threshold} sell_th={sell_threshold}")
+    print(f"{mode_label} started | buy_th={buy_threshold:.4f} sell_th={sell_threshold:.4f}")
+    print(f"Metrics source: buy_raw={raw_buy:.4f} sell_raw={raw_sell:.4f} | offset buy={LIVE_BUY_THRESHOLD_OFFSET} sell={LIVE_SELL_THRESHOLD_OFFSET}")
     if paper_mode:
         print("Paper mode: no MT5 orders will be sent; signals are logged only.")
     else:
         print(f"Safety: max_daily_loss={MAX_DAILY_LOSS_PCT:.1%} max_positions={MAX_OPEN_POSITIONS}")
         print(f"        equity_dd_stop={EQUITY_DRAWDOWN_STOP_PCT:.1%} position_timeout={MAX_POSITION_HOURS}h")
-        print(f"        max_latency={MAX_LATENCY_MS}ms max_stale={MAX_STALE_MINUTES}min")
+        print(f"        max_latency={MAX_LATENCY_MS}ms max_stale={MAX_STALE_MINUTES}min max_spread={MAX_SPREAD_POINTS}pts")
 
     while True:
         try:
@@ -379,6 +395,9 @@ def run_live(paper_mode: bool = False):
 
             if side == 0:
                 log_reject(signal_time, "reject_threshold", p_buy, p_sell, spread_points, signal_row, log_path=log_path)
+                # Log near-miss để dễ debug (chỉ khi gần threshold)
+                if max(p_buy, p_sell) >= min(buy_threshold, sell_threshold) * 0.88:
+                    print(f"Near-miss | {signal_time} | p_buy={p_buy:.3f} p_sell={p_sell:.3f} | need buy>={buy_threshold:.3f} sell>={sell_threshold:.3f}")
                 time.sleep(2)
                 continue
 

@@ -66,26 +66,27 @@ TIMEFRAMES = {
 # ── Model / Training ──
 SEQ_LEN = 64
 BATCH_SIZE = 256
-MAX_EPOCHS = 60
+MAX_EPOCHS = 50          # Giảm từ 60 → 50
 LR = 5e-4
 MAX_LR = 1.5e-3
 
-CNN_CHANNELS = 192
-LSTM_HIDDEN = 192
+# Model size giảm ~40% so với trước → giảm capacity → ít overfit hơn
+CNN_CHANNELS = 128        # trước: 192
+LSTM_HIDDEN = 128         # trước: 192
 LSTM_LAYERS = 2
-DROPOUT = 0.30
-DROP_PATH_RATE = 0.1
+DROPOUT = 0.50            # trước: 0.30 → tăng mạnh
+DROP_PATH_RATE = 0.25     # trước: 0.10 → tăng mạnh
 
-TRANSFORMER_DIM = 192
-TRANSFORMER_HEADS = 6
-TRANSFORMER_LAYERS = 4
+TRANSFORMER_DIM = 128     # trước: 192
+TRANSFORMER_HEADS = 4     # trước: 6
+TRANSFORMER_LAYERS = 3    # trước: 4
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
 
-EARLY_STOPPING_PATIENCE = 12
-WEIGHT_DECAY = 1e-4
-LABEL_SMOOTHING = 0.05
+EARLY_STOPPING_PATIENCE = 8    # trước: 12 → dừng sớm hơn trước khi overfit
+WEIGHT_DECAY = 5e-4            # trước: 1e-4 → tăng L2 regularization
+LABEL_SMOOTHING = 0.12         # trước: 0.05 → giảm pseudo-confidence
 USE_FOCAL_LOSS = True
 FOCAL_GAMMA = 2.0
 USE_AMP = torch.cuda.is_available()
@@ -100,22 +101,24 @@ WARMUP_EPOCHS = 3
 # Gradient accumulation
 GRAD_ACCUM_STEPS = 2
 
-# Mixup augmentation
+# Mixup augmentation — alpha cao hơn = interpolation mạnh hơn = giảm overfit
 USE_MIXUP = True
-MIXUP_ALPHA = 0.2
+MIXUP_ALPHA = 0.4             # trước: 0.2
 
 # Multi-seed ensemble
 USE_ENSEMBLE = False
 ENSEMBLE_SEEDS = [42, 123, 456]
 
 # ── Labeling ──
-HORIZON_BARS = 30
+HORIZON_BARS = 40        # Tăng từ 30 lên 40 để giảm class-0 imbalance
 SL_ATR_MULT = 1.4
-MIN_RR = 1.3
+MIN_RR = 1.1             # Giảm từ 1.3 → dễ label buy/sell hơn, Win rate tăng
 USE_ADAPTIVE_RR = True
 
-TRAIN_RATIO = 0.70
-VALID_RATIO = 0.15
+TRAIN_RATIO = 0.65        # trước: 0.70 → giảm một chút để nhường chỗ calibration
+VALID_RATIO = 0.10        # trước: 0.15 → chỉ dùng cho early stopping
+CALIB_RATIO = 0.10        # Mới: dùng riêng cho optimize_thresholds (model chưa thấy)
+# Test = 1 - TRAIN_RATIO - VALID_RATIO - CALIB_RATIO = 15%
 
 # ── Walk-forward ──
 WF_TRAIN_BARS = 60000
@@ -157,11 +160,11 @@ SIGNAL_SMOOTH_BARS = 3
 COOLDOWN_BARS = 10
 REJECT_COOLDOWN_BARS = 2
 
-BUY_THRESHOLD_GRID = [0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62]
-SELL_THRESHOLD_GRID = [0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62]
+BUY_THRESHOLD_GRID = [0.58, 0.60, 0.62, 0.64, 0.66, 0.68]
+SELL_THRESHOLD_GRID = [0.58, 0.60, 0.62, 0.64, 0.66, 0.68]
 
-LIVE_BUY_THRESHOLD_OFFSET = 0.02
-LIVE_SELL_THRESHOLD_OFFSET = 0.02
+LIVE_BUY_THRESHOLD_OFFSET = 0.00   # Threshold đã cao, không cần offset thêm
+LIVE_SELL_THRESHOLD_OFFSET = 0.00
 
 MIN_ATR_PCT = 0.00014
 MIN_M15_TREND_STRENGTH = 0.00004
@@ -169,16 +172,16 @@ MIN_H1_TREND_STRENGTH = 0.00004
 
 if IS_XAU_ACTIVE_PROFILE:
     # Slightly more active XAU variant: easier labels and gentler live filters.
-    HORIZON_BARS = 24
+    HORIZON_BARS = 36
     SL_ATR_MULT = 1.30
-    MIN_RR = 1.20
+    MIN_RR = 1.0
     SIGNAL_SMOOTH_BARS = 2
     COOLDOWN_BARS = 6
     REJECT_COOLDOWN_BARS = 1
-    BUY_THRESHOLD_GRID = [0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60]
-    SELL_THRESHOLD_GRID = [0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60]
-    LIVE_BUY_THRESHOLD_OFFSET = 0.01
-    LIVE_SELL_THRESHOLD_OFFSET = 0.01
+    BUY_THRESHOLD_GRID = [0.56, 0.58, 0.60, 0.62, 0.64, 0.66]
+    SELL_THRESHOLD_GRID = [0.56, 0.58, 0.60, 0.62, 0.64, 0.66]
+    LIVE_BUY_THRESHOLD_OFFSET = 0.00
+    LIVE_SELL_THRESHOLD_OFFSET = 0.00
     MIN_ATR_PCT = 0.00012
     MIN_M15_TREND_STRENGTH = 0.00003
     MIN_H1_TREND_STRENGTH = 0.00003
@@ -187,20 +190,20 @@ if IS_BTC_PROFILE:
     # BTC trades continuously, so the XAU session/news gates are usually too restrictive.
     SESSION_FILTER = False
     USE_NEWS_FILTER = False
-    MAX_SPREAD_POINTS = _env_int("TRADE_BOT_BTC_MAX_SPREAD_POINTS", 5000)
+    MAX_SPREAD_POINTS = _env_int("TRADE_BOT_BTC_MAX_SPREAD_POINTS", 1270)
 
 if IS_BTC_ACTIVE_PROFILE:
     # More active BTC variant: same 24/7 handling as BTC base, but with easier labels/live gates.
-    HORIZON_BARS = 24
+    HORIZON_BARS = 36
     SL_ATR_MULT = 1.30
-    MIN_RR = 1.20
+    MIN_RR = 1.0
     SIGNAL_SMOOTH_BARS = 2
     COOLDOWN_BARS = 6
     REJECT_COOLDOWN_BARS = 1
-    BUY_THRESHOLD_GRID = [0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60]
-    SELL_THRESHOLD_GRID = [0.46, 0.48, 0.50, 0.52, 0.54, 0.56, 0.58, 0.60]
-    LIVE_BUY_THRESHOLD_OFFSET = 0.01
-    LIVE_SELL_THRESHOLD_OFFSET = 0.01
+    BUY_THRESHOLD_GRID = [0.56, 0.58, 0.60, 0.62, 0.64, 0.66]
+    SELL_THRESHOLD_GRID = [0.56, 0.58, 0.60, 0.62, 0.64, 0.66]
+    LIVE_BUY_THRESHOLD_OFFSET = 0.00
+    LIVE_SELL_THRESHOLD_OFFSET = 0.00
     MIN_ATR_PCT = 0.00012
     MIN_M15_TREND_STRENGTH = 0.00003
     MIN_H1_TREND_STRENGTH = 0.00003
@@ -227,6 +230,8 @@ RISK_PER_TRADE = 0.002
 MAX_LOT = 0.10
 MAGIC = 26032026
 DEVIATION = 20
+if IS_BTC_PROFILE:
+    DEVIATION = _env_int("TRADE_BOT_BTC_DEVIATION", 10)
 
 USE_BREAK_EVEN = True
 BE_TRIGGER_R = 1.0

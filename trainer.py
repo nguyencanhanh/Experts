@@ -13,6 +13,9 @@ from config import (
     USE_COSINE_ANNEALING, WARMUP_EPOCHS,
     GRAD_ACCUM_STEPS, USE_MIXUP, MIXUP_ALPHA,
 )
+
+# Gaussian noise std — thêm noise nhỏ vào input lúc train để giảm overfit
+TRAIN_NOISE_STD = 0.02
 from utils import FocalLoss, ModelEMA
 from model import CNNBiLSTMTransformer
 from sequence_dataset import SequenceDataset
@@ -57,6 +60,15 @@ def train_model(train_ds: SequenceDataset, valid_ds: SequenceDataset, input_size
 
     y_train = train_ds.get_all_targets()
     class_weights = compute_class_weights(y_train)
+
+    # ── Log class distribution để theo dõi imbalance ──
+    counts = np.bincount(y_train, minlength=3)
+    n_total = len(y_train)
+    class0_pct = counts[0] / n_total
+    print(f"Train class dist: 0={counts[0]}({class0_pct:.1%}) 1={counts[1]}({counts[1]/n_total:.1%}) 2={counts[2]}({counts[2]/n_total:.1%})")
+    if class0_pct > 0.70:
+        print(f"[WARNING] Class 0 = {class0_pct:.1%} > 70% — model sẽ thiên về 'không vào lệnh'. Xem xét giảm MIN_RR hoặc tăng HORIZON_BARS trong config.py")
+    print(f"          class_weights: {class_weights.tolist()}")
 
     if USE_FOCAL_LOSS:
         criterion = FocalLoss(alpha=class_weights, gamma=FOCAL_GAMMA, label_smoothing=LABEL_SMOOTHING)
@@ -107,6 +119,10 @@ def train_model(train_ds: SequenceDataset, valid_ds: SequenceDataset, input_size
         for step, (xb, yb) in enumerate(train_loader):
             xb = xb.to(DEVICE)
             yb = yb.to(DEVICE)
+
+            # ── Gaussian noise augmentation (giảm overfit) ──
+            if TRAIN_NOISE_STD > 0:
+                xb = xb + torch.randn_like(xb) * TRAIN_NOISE_STD
 
             # ── Mixup augmentation ──
             if USE_MIXUP:
@@ -191,7 +207,15 @@ def train_model(train_ds: SequenceDataset, valid_ds: SequenceDataset, input_size
             "improved": bool(improved),
         })
         improved_mark = "*" if improved else ""
-        print(f"epoch={epoch+1}/{MAX_EPOCHS} train_loss={train_loss:.5f} valid_loss={valid_loss:.5f} time={epoch_time:.0f}s pat={patience_left} {improved_mark}")
+        # Overfit monitor: in gap mỗi 5 epoch
+        gap_note = ""
+        if (epoch + 1) % 5 == 0 or patience_left <= 2:
+            gap = train_loss - valid_loss
+            if valid_loss < train_loss * 0.85:
+                gap_note = f" [OVERFIT gap={gap:.4f}]"
+            elif valid_loss > train_loss * 1.15:
+                gap_note = f" [UNDERFIT gap={gap:.4f}]"
+        print(f"epoch={epoch+1}/{MAX_EPOCHS} train_loss={train_loss:.5f} valid_loss={valid_loss:.5f} time={epoch_time:.0f}s pat={patience_left} {improved_mark}{gap_note}")
 
         if patience_left <= 0:
             print("Early stopping")

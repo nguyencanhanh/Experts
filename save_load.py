@@ -85,7 +85,11 @@ def load_inference_bundle(device: str):
 
     missing = [path for path in [MODEL_PATH, SCALER_PATH, FEATURES_PATH, METRICS_PATH] if not os.path.exists(path)]
     if missing:
-        raise RuntimeError(f"Missing artifacts: {', '.join(missing)}")
+        missing_str = ", ".join(missing)
+        raise RuntimeError(
+            "Missing model artifacts. Run the training pipeline first (e.g. `python main.py --mode pipeline`). "
+            f"Missing files: {missing_str}"
+        )
 
     checkpoint = torch.load(MODEL_PATH, map_location=device)
     scaler = joblib.load(SCALER_PATH)

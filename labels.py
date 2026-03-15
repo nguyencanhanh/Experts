@@ -33,6 +33,8 @@ def build_labels_no_lookahead(df: pd.DataFrame, horizon: int = HORIZON_BARS,
     # ── Adaptive RR: lower RR in low-volatility regimes ──
     atr_finite = atr_vals[np.isfinite(atr_vals) & (atr_vals > 0)]
     atr_median = np.median(atr_finite) if len(atr_finite) > 0 else 1.0
+    # Dùng percentile 25 để tính low-vol boundary rõ hơn
+    atr_p25 = np.percentile(atr_finite, 25) if len(atr_finite) > 0 else atr_median
 
     for signal_idx in range(len(df) - horizon - 2):
         entry_idx = signal_idx + 1
@@ -50,9 +52,17 @@ def build_labels_no_lookahead(df: pd.DataFrame, horizon: int = HORIZON_BARS,
 
         sl_dist = atr_now * sl_atr_mult
 
-        # Adaptive RR: reduce target in low-vol regimes to get more balanced labels
-        if USE_ADAPTIVE_RR and atr_now < atr_median:
-            effective_rr = min_rr * 0.85
+        # Adaptive RR:
+        # - Low-vol (< p25): dùng min_rr * 0.75 → dễ đạt TP hơn → giảm class 0
+        # - Medium-vol (p25 ~ median): min_rr * 0.90
+        # - High-vol (> median): min_rr (full)
+        if USE_ADAPTIVE_RR:
+            if atr_now < atr_p25:
+                effective_rr = min_rr * 0.75
+            elif atr_now < atr_median:
+                effective_rr = min_rr * 0.90
+            else:
+                effective_rr = min_rr
         else:
             effective_rr = min_rr
 

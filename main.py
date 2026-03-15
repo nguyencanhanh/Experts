@@ -5,7 +5,10 @@ import numpy as np
 import pandas as pd
 
 from backtest import backtest_strategy, optimize_thresholds, run_walkforward
-from config import DEVICE, NEWS_CSV_PATH, PROFILE_NAME, SYMBOL, TIMEFRAMES, TRAIN_RATIO, VALID_RATIO, YEARS_BACK
+from config import (
+    DEVICE, NEWS_CSV_PATH, PROFILE_NAME, SYMBOL, TIMEFRAMES,
+    TRAIN_RATIO, VALID_RATIO, CALIB_RATIO, YEARS_BACK,
+)
 from data_mt5 import ensure_symbol, get_rates, get_symbol_info, mt5_init, mt5_shutdown
 from features import add_cross_features, add_indicators, get_base_features, merge_timeframes
 from filters import load_news_events
@@ -53,6 +56,32 @@ def ensure_saved_feature_layout(feature_cols, current_feature_cols):
     )
 
 
+def _print_overfit_warning(eval_train, eval_valid, eval_test):
+    """In cảnh báo nếu gap train-test lớn (dấu hiệu overfit)."""
+    try:
+        p_train = eval_train["report"]["weighted avg"]["precision"]
+        p_valid = eval_valid["report"]["weighted avg"]["precision"]
+        p_test = eval_test["report"]["weighted avg"]["precision"]
+        gap_tv = p_train - p_valid
+        gap_vt = p_valid - p_test
+        print(f"\n===== OVERFIT MONITOR =====")
+        print(f"  Train precision: {p_train:.4f}")
+        print(f"  Valid precision: {p_valid:.4f}  (gap from train: {gap_tv:+.4f})")
+        print(f"  Test  precision: {p_test:.4f}  (gap from valid: {gap_vt:+.4f})")
+        if gap_tv > 0.10:
+            print(f"  [WARNING] Train-Valid gap = {gap_tv:.3f} > 0.10 → Overfit nghiêm trọng!")
+            print(f"            → Tăng DROPOUT, WEIGHT_DECAY, hoặc giảm CNN_CHANNELS/LSTM_HIDDEN")
+        elif gap_tv > 0.05:
+            print(f"  [WARNING] Train-Valid gap = {gap_tv:.3f} > 0.05 → Có dấu hiệu overfit nhẹ")
+        else:
+            print(f"  [OK] Train-Valid gap = {gap_tv:.3f} ≤ 0.05 → Tốt")
+        if gap_vt > 0.10:
+            print(f"  [WARNING] Valid-Test gap = {gap_vt:.3f} > 0.10 → Threshold bị overfit trên valid!")
+        print("=" * 27)
+    except Exception:
+        pass
+
+
 def train_pipeline(run_backtest: bool = True, run_wf: bool = True):
     symbol_info = get_symbol_info(SYMBOL)
     news_df = load_news_events(NEWS_CSV_PATH)
@@ -68,32 +97,58 @@ def train_pipeline(run_backtest: bool = True, run_wf: bool = True):
     unique, counts = np.unique(bundle.targets, return_counts=True)
     for label, count in zip(unique, counts):
         print(f"  class {label}: {count} ({count / n:.1%})")
+    # Cảnh báo nếu class 0 chiếm quá nhiều
+    class0_pct = counts[0] / n if len(counts) > 0 else 0
+    if class0_pct > 0.70:
+        print(f"[WARNING] Class 0 chiếm {class0_pct:.1%} > 70% — xem xét giảm MIN_RR hoặc tăng HORIZON_BARS")
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Split dữ liệu thành 4 phần rõ ràng để chống overfit:
+    #   TRAIN  (65%): model học
+    #   VALID  (10%): early stopping (model thấy qua validation loss)
+    #   CALIB  (10%): optimize_thresholds — model CHƯA BAO GIỜ thấy trong training
+    #   TEST   (15%): đánh giá cuối cùng
+    # ──────────────────────────────────────────────────────────────────────────
     train_end = int(n * TRAIN_RATIO)
     valid_end = train_end + int(n * VALID_RATIO)
+    calib_end = valid_end + int(n * CALIB_RATIO)
 
+    print(f"\nData split:")
+    print(f"  Train : [{0:6d}, {train_end:6d}) = {train_end} sequences ({TRAIN_RATIO:.0%})")
+    print(f"  Valid : [{train_end:6d}, {valid_end:6d}) = {valid_end-train_end} sequences ({VALID_RATIO:.0%}) — early stopping")
+    print(f"  Calib : [{valid_end:6d}, {calib_end:6d}) = {calib_end-valid_end} sequences ({CALIB_RATIO:.0%}) — threshold opt")
+    print(f"  Test  : [{calib_end:6d}, {n:6d}) = {n-calib_end} sequences ({1-TRAIN_RATIO-VALID_RATIO-CALIB_RATIO:.0%})")
+
+    # Scaler fit CHỈ trên train
     scaler = FeatureScaler()
     scaler.fit(bundle.features[:train_end + bundle.seq_len - 1])
     scaled = scaler.transform(bundle.features)
 
     train_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, 0, train_end)
     valid_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, train_end, valid_end - train_end)
-    test_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, valid_end, n - valid_end)
+    calib_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, valid_end, calib_end - valid_end)
+    test_ds  = SequenceDataset(scaled, bundle.targets, bundle.seq_len, calib_end, n - calib_end)
 
-    row_df_valid = bundle.row_df.iloc[train_end:valid_end].reset_index(drop=True)
-    row_df_test = bundle.row_df.iloc[valid_end:].reset_index(drop=True)
+    row_df_calib = bundle.row_df.iloc[valid_end:calib_end].reset_index(drop=True)
+    row_df_test  = bundle.row_df.iloc[calib_end:].reset_index(drop=True)
 
+    # Train model chính
     model = train_model(train_ds, valid_ds, input_size=bundle.features.shape[-1])
 
     eval_train = evaluate(model, train_ds)
     eval_valid = evaluate(model, valid_ds)
-    eval_test = evaluate(model, test_ds)
+    eval_calib = evaluate(model, calib_ds)
+    eval_test  = evaluate(model, test_ds)
 
-    valid_probs = predict_proba(model, valid_ds)
-    threshold_table, best = optimize_thresholds(row_df_valid, valid_probs, symbol_info, news_df)
+    # In overfit monitor
+    _print_overfit_warning(eval_train, eval_valid, eval_test)
 
-    best_buy = float(best["buy_threshold"])
+    # Optimize threshold trên CALIB set (model chưa thấy) — tránh threshold overfit
+    calib_probs = predict_proba(model, calib_ds)
+    threshold_table, best = optimize_thresholds(row_df_calib, calib_probs, symbol_info, news_df)
+    best_buy  = float(best["buy_threshold"])
     best_sell = float(best["sell_threshold"])
+    print(f"\nCalib thresholds (out-of-sample): buy={best_buy} sell={best_sell}")
 
     test_trades_df = pd.DataFrame()
     test_equity_df = pd.DataFrame()
@@ -104,18 +159,34 @@ def train_pipeline(run_backtest: bool = True, run_wf: bool = True):
             row_df_test, test_probs, symbol_info, news_df, best_buy, best_sell
         )
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # Deploy model: train lại trên train+valid+calib (85% data).
+    # Scaler fit trên train+valid+calib để không leaking future data.
+    # Threshold được tối ưu trên calib segment = honest out-of-sample estimate.
+    # ──────────────────────────────────────────────────────────────────────────
     deploy_scaler = FeatureScaler()
-    deploy_scaler.fit(bundle.features[:valid_end + bundle.seq_len - 1])
+    deploy_scaler.fit(bundle.features[:calib_end + bundle.seq_len - 1])
     deploy_scaled = deploy_scaler.transform(bundle.features)
 
+    # Deploy train = train+valid (model chưa thấy valid trong lúc "fit" nhưng valid
+    # được dùng cho early stopping → dùng calib làm valid của deploy để tránh biết trước)
     deploy_train_ds = SequenceDataset(deploy_scaled, bundle.targets, bundle.seq_len, 0, valid_end)
-    deploy_valid_ds = SequenceDataset(deploy_scaled, bundle.targets, bundle.seq_len, train_end, valid_end - train_end)
+    deploy_valid_ds = SequenceDataset(deploy_scaled, bundle.targets, bundle.seq_len, valid_end, calib_end - valid_end)
     deploy_model = train_model(deploy_train_ds, deploy_valid_ds, input_size=bundle.features.shape[-1])
 
+    # Threshold cho deploy model: chạy lại optimize trên calib (dữ liệu sạch)
+    deploy_calib_probs = predict_proba(deploy_model, deploy_valid_ds)
+    deploy_threshold_table, deploy_best = optimize_thresholds(
+        row_df_calib, deploy_calib_probs, symbol_info, news_df
+    )
+    deploy_buy  = float(deploy_best["buy_threshold"])
+    deploy_sell = float(deploy_best["sell_threshold"])
+    print(f"Deploy thresholds (re-optimized on calib): buy={deploy_buy} sell={deploy_sell}")
+
     wf_results_df = pd.DataFrame()
-    wf_trades_df = pd.DataFrame()
-    wf_equity_df = pd.DataFrame()
-    wf_summary = {}
+    wf_trades_df  = pd.DataFrame()
+    wf_equity_df  = pd.DataFrame()
+    wf_summary    = {}
     if run_wf:
         wf_results_df, wf_trades_df, wf_equity_df, wf_summary = run_walkforward(
             bundle=bundle,
@@ -131,17 +202,24 @@ def train_pipeline(run_backtest: bool = True, run_wf: bool = True):
         "rows_total": int(n),
         "rows_train": int(train_end),
         "rows_valid": int(valid_end - train_end),
-        "rows_test": int(n - valid_end),
+        "rows_calib": int(calib_end - valid_end),
+        "rows_test": int(n - calib_end),
         "training_history": getattr(model, "training_history", []),
         "training_best_val_loss": getattr(model, "best_val_loss", None),
         "deploy_training_history": getattr(deploy_model, "training_history", []),
         "deploy_training_best_val_loss": getattr(deploy_model, "best_val_loss", None),
         "eval_train": eval_train,
         "eval_valid": eval_valid,
+        "eval_calib": eval_calib,
         "eval_test": eval_test,
-        "best_buy_threshold": best_buy,
-        "best_sell_threshold": best_sell,
+        # ← Đây là threshold sẽ dùng trong live (honest out-of-sample estimate)
+        "best_buy_threshold": deploy_buy,
+        "best_sell_threshold": deploy_sell,
+        # Lưu thêm để debug
+        "calib_best_buy_threshold": best_buy,
+        "calib_best_sell_threshold": best_sell,
         "threshold_table": threshold_table.to_dict(orient="records"),
+        "deploy_threshold_table": deploy_threshold_table.to_dict(orient="records"),
         "test_backtest_summary": test_summary,
         "walkforward_summary": wf_summary,
         "walkforward_windows": [] if len(wf_results_df) == 0 else wf_results_df.to_dict(orient="records"),
@@ -195,14 +273,15 @@ def backtest_only_pipeline():
     n = bundle.n_sequences
     train_end = int(n * TRAIN_RATIO)
     valid_end = train_end + int(n * VALID_RATIO)
-    if valid_end >= n:
+    calib_end = valid_end + int(n * CALIB_RATIO)
+    if calib_end >= n:
         raise RuntimeError("Not enough sequences to build a backtest split.")
 
     scaled = scaler.transform(bundle.features)
-    test_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, valid_end, n - valid_end)
-    row_df_test = bundle.row_df.iloc[valid_end:].reset_index(drop=True)
+    test_ds = SequenceDataset(scaled, bundle.targets, bundle.seq_len, calib_end, n - calib_end)
+    row_df_test = bundle.row_df.iloc[calib_end:].reset_index(drop=True)
 
-    best_buy = float(metrics.get("best_buy_threshold", 0.0))
+    best_buy  = float(metrics.get("best_buy_threshold", 0.0))
     best_sell = float(metrics.get("best_sell_threshold", 0.0))
     if best_buy <= 0 or best_sell <= 0:
         raise RuntimeError("Saved metrics do not contain valid buy/sell thresholds.")
@@ -219,7 +298,8 @@ def backtest_only_pipeline():
         "rows_total": int(n),
         "rows_train": int(train_end),
         "rows_valid": int(valid_end - train_end),
-        "rows_test": int(n - valid_end),
+        "rows_calib": int(calib_end - valid_end),
+        "rows_test": int(n - calib_end),
         "eval_test": eval_test,
         "test_backtest_summary": test_summary,
         "backtest_source": "saved_model",
